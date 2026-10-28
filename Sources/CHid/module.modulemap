@@ -1,0 +1,5 @@
+module CHid [system] {
+    header "shim.h"
+    link "hidapi"
+    export *
+}
