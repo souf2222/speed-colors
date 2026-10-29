@@ -13,17 +13,111 @@ import SpeedColorsCore
 struct SpeedColorsUIApp: App {
     @StateObject private var controller = DaemonController()
 
+    init() {
+        // Menu bar app: no Dock icon (the .app bundle's LSUIElement covers the
+        // packaged case; this covers `swift run` from the build tree).
+        // NSApp is nil during App.init — touching NSApplication.shared first
+        // materializes it.
+        _ = NSApplication.shared
+        NSApp.setActivationPolicy(.accessory)
+    }
+
     var body: some Scene {
-        WindowGroup("SpeedColors") {
-            AppShell()
-                .environmentObject(controller)
-                .frame(minWidth: 1180, minHeight: 860)
-                .onAppear {
-                    NSApp.activate(ignoringOtherApps: true)
-                    controller.startDaemon()
-                }
+        MenuBarExtra {
+            MenuBarPanel(controller: controller)
+        } label: {
+            Image(systemName: "circle.lefthalf.filled")
         }
-        .windowResizability(.contentMinSize)
+        .menuBarExtraStyle(.window)
+    }
+}
+
+// MARK: - Menu bar panel
+
+/// The compact menu bar panel: live status + quick actions, and the entry
+/// point to the full control window.
+struct MenuBarPanel: View {
+    @ObservedObject var controller: DaemonController
+
+    private var statusColor: Color {
+        controller.deviceConnected ? Graphite.green
+            : (controller.isRunning ? Graphite.amber : Graphite.text3)
+    }
+    private var statusLabel: String {
+        if !controller.isRunning { return "daemon stopped" }
+        if !controller.accessibilityOK { return "needs Accessibility" }
+        return controller.deviceConnected ? "Speed Editor live" : "waiting for device…"
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 6) {
+                Text("SpeedColors")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(Graphite.text)
+                Spacer()
+                Pill(color: statusColor, label: statusLabel)
+            }
+
+            if let line = controller.batteryLine {
+                Text(line)
+                    .font(.system(size: 10).monospacedDigit())
+                    .foregroundColor(Graphite.text3)
+            }
+            Pill(color: controller.page == "color" ? Graphite.cyan : Graphite.text3,
+                 label: controller.page.map { p in p == "color" ? "COLOR PAGE" : "page: \(p)" }
+                        ?? "Resolve not detected")
+
+            Divider().overlay(Graphite.border)
+
+            HStack(spacing: 8) {
+                Button(controller.isRunning ? "Stop daemon" : "Start daemon") {
+                    if controller.isRunning { controller.stopDaemon() } else { controller.startDaemon() }
+                    MainWindow.shared.show(controller: controller)
+                }
+                .buttonStyle(GraphiteButtonStyle())
+                Button("Full control…") {
+                    controller.startDaemon()
+                    MainWindow.shared.show(controller: controller)
+                }
+                .buttonStyle(GraphiteButtonStyle(accent: Graphite.blue))
+            }
+
+            HStack(spacing: 8) {
+                Button("Quit") { NSApp.terminate(nil) }
+                    .buttonStyle(MiniButtonStyle())
+                Spacer()
+            }
+        }
+        .padding(12)
+        .frame(width: 300)
+        .background(Graphite.bg)
+        .preferredColorScheme(.dark)
+    }
+}
+
+// MARK: - Full control window
+
+/// Hosts the full AppShell in a plain Cocoa window. There is deliberately no
+/// WindowGroup scene — the app is menu-bar-first; this window summons on demand.
+final class MainWindow {
+    static let shared = MainWindow()
+    private var window: NSWindow?
+
+    func show(controller: DaemonController) {
+        if window == nil {
+            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1180, height: 860),
+                             styleMask: [.titled, .closable, .miniaturizable, .resizable],
+                             backing: .buffered, defer: false)
+            w.title = "SpeedColors"
+            w.contentMinSize = NSSize(width: 1080, height: 780)
+            w.isReleasedWhenClosed = false
+            w.contentView = NSHostingView(rootView: AppShell().environmentObject(controller))
+            w.center()
+            window = w
+        }
+        window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 }
 
@@ -75,7 +169,20 @@ final class DaemonController: ObservableObject {
 
     // UI navigation & selection
     @Published var section: AppSection = .controls
-    @Published var selectedControl: SEControl?
+    @Published var selectedControl: SEControl? {
+        didSet {
+            func tag(_ c: SEControl?) -> String {
+                switch c {
+                case .key(let k): return "key:\(k.id)"
+                case .dial: return "dial"
+                case nil: return "nil"
+                }
+            }
+            if tag(selectedControl) != tag(oldValue) {
+                appendLog("◀ select \(tag(selectedControl)) (was \(tag(oldValue)))")
+            }
+        }
+    }
     @Published var selectedTargetId: String?
 
     // Clipboard (bindings)
@@ -101,6 +208,14 @@ final class DaemonController: ObservableObject {
 
     init() {
         config = ColorModeConfig.load()
+        // Debug/DI only: `SC_OPEN_WINDOW=1` opens the editor window at launch
+        // so the in-app behavior can be driven/exercised headlessly.
+        if ProcessInfo.processInfo.environment["SC_OPEN_WINDOW"] == "1" {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+                guard let self else { return }
+                MainWindow.shared.show(controller: self)
+            }
+        }
     }
 
     // MARK: Daemon lifecycle
@@ -212,12 +327,33 @@ final class DaemonController: ObservableObject {
     }
 
     func setBindingName(_ keyId: String, _ name: String) {
+        appendLog("✍ name \(keyId) → '\(name)'")
         freshConfigThen { c in
             if name.isEmpty {
                 c.bindingNames[keyId] = nil
             } else {
                 c.bindingNames[keyId] = name
             }
+        }
+    }
+
+    /// Custom key-face label for the hardware replica (empty = hardware text).
+    func setKeyLabel(_ keyId: String, _ name: String) {
+        appendLog("✍ label \(keyId) → '\(name)'")
+        freshConfigThen { c in
+            if name.isEmpty {
+                c.keyLabels[keyId] = nil
+            } else {
+                c.keyLabels[keyId] = name
+            }
+        }
+    }
+
+    /// Whether the key-face legend follows the binding name.
+    func setKeyLabelFromBinding(_ keyId: String, _ on: Bool) {
+        appendLog("✍ nameOnKey \(keyId) → \(on)")
+        freshConfigThen { c in
+            c.labelFromBinding[keyId] = on ? true : nil
         }
     }
 
@@ -236,6 +372,7 @@ final class DaemonController: ObservableObject {
     /// Set a phase's step sequence. Explicit empty array = deliberately unbound
     /// (the daemon then mirrors native behavior on non-Color pages).
     func setBinding(_ keyId: String, phase: BindingPhase, _ steps: [MacroStep]) {
+        appendLog("✍ steps \(keyId)/\(phase) n=\(steps.count)")
         pushUndo(keyId: keyId, phase: phase)
         freshConfigThen { c in
             switch phase {
@@ -318,8 +455,31 @@ final class DaemonController: ObservableObject {
 
     /// Saves a calibrated position (mouse-position calibration flow).
     func saveTarget(_ name: String, _ point: CGPoint) {
-        freshConfigThen { $0.targets[name] = ColorTarget(x: Double(point.x), y: Double(point.y)) }
+        freshConfigThen { c in
+            c.targets[name] = ColorTarget(x: Double(point.x), y: Double(point.y))
+            // Custom ids get identity metadata too (renamable in the library).
+            if TargetCatalog.entry(for: name) == nil && c.customTargets[name] == nil {
+                c.addCustomTarget(id: name, label: name)
+            }
+        }
         appendLog("· target '\(name)' calibrated → (\(Int(point.x)), \(Int(point.y)))")
+    }
+
+    /// Creates a user-defined target (uncalibrated unless a point is given).
+    /// Returns false if the id is taken (already known or in the catalog).
+    func addCustomTarget(id: String, label: String) -> Bool {
+        var ok = false
+        freshConfigThen { c in
+            guard !id.isEmpty, !c.isKnownTarget(id), TargetCatalog.entry(for: id) == nil else { return }
+            c.addCustomTarget(id: id, label: label.isEmpty ? id : label)
+            ok = true
+        }
+        if ok {
+            appendLog("· custom target '\(label.isEmpty ? id : label)' added (\(id))")
+        } else {
+            appendLog("✗ '\(id)' already exists — choose another id")
+        }
+        return ok
     }
 
     func targetUsage(_ name: String) -> [String] {
@@ -327,7 +487,8 @@ final class DaemonController: ObservableObject {
     }
 
     func renameTarget(_ old: String, to new: String) -> Bool {
-        guard config.targets[old] != nil else { return false }
+        // Renaming only applies to custom targets — catalog ids are stable.
+        guard TargetCatalog.entry(for: old) == nil else { return false }
         var ok = false
         freshConfigThen { c in
             ok = c.renameTarget(old, to: new)
@@ -339,6 +500,17 @@ final class DaemonController: ObservableObject {
     func deleteTarget(_ name: String) {
         freshConfigThen { $0.removeTarget(named: name) }
         appendLog("· target '\(name)' deleted")
+    }
+
+    func toggleTargetFavorite(_ id: String) {
+        freshConfigThen { c in
+            if let i = c.favoriteTargets.firstIndex(of: id) { c.favoriteTargets.remove(at: i) }
+            else { c.favoriteTargets.append(id) }
+        }
+    }
+
+    func isFavoriteTarget(_ id: String) -> Bool {
+        config.favoriteTargets.contains(id)
     }
 
     func testTarget(_ name: String) {
@@ -517,8 +689,27 @@ final class DaemonController: ObservableObject {
 
     // MARK: Log
 
-    private func appendLog(_ line: String) {
-        logLines.append(line)
+    /// Disk-backed mirror of `logLines` so the exact write sequence survives
+    /// relaunches and can be read back when hunting state bugs.
+    private let logFileURL = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".speedcolors/ui.log")
+    private lazy var logStamp: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss.SSS"
+        return f
+    }()
+
+    func appendLog(_ line: String) {
+        let stamped = "[\(logStamp.string(from: Date()))] \(line)"
+        logLines.append(stamped)
         if logLines.count > 400 { logLines.removeFirst(logLines.count - 400) }
+        let data = Data("\(stamped)\n".utf8)
+        if let fh = try? FileHandle(forWritingTo: logFileURL) {
+            defer { try? fh.close() }
+            _ = try? fh.seekToEnd()
+            try? fh.write(contentsOf: data)
+        } else {
+            try? data.write(to: logFileURL)
+        }
     }
 }

@@ -23,9 +23,14 @@ struct BindingInspectorPane: View {
                            title: "Select a control",
                            detail: "Click a button or the dial in the layout to edit what it does on the Color page.")
             case .key(let key):
+                // Fresh identity per key: @State can never carry one key's
+                // drafts/labels into another key's editor (the "settings copy"
+                // bug), and no onChange closure can fire with a stale key.
                 KeyInspector(controller: controller, key: key)
+                    .id(key.id)
             case .dial:
                 DialInspector(controller: controller)
+                    .id("dial")
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
@@ -42,9 +47,16 @@ struct KeyInspector: View {
     @State private var draftPressed: [MacroStep] = []
     @State private var draftReleased: [MacroStep] = []
     @State private var nameDraft = ""
+    @State private var labelDraft = ""
+    @State private var labelFromBindingDraft = false
     @State private var enabled = true
     @State private var nameSaveWork: DispatchWorkItem?
+    @State private var labelSaveWork: DispatchWorkItem?
     @State private var showReleased = false
+    @State private var dropActive = false
+    @State private var releasedDropActive = false
+
+    private var emptyBinding: Bool { draftPressed.isEmpty && draftReleased.isEmpty }
 
     private var keyId: String { key.id }
     private var isDialModeKey: Bool { key == .shtl || key == .jog || key == .scrl }
@@ -62,7 +74,6 @@ struct KeyInspector: View {
             }
         }
         .onAppear(perform: sync)
-        .onChange(of: controller.selectedControl) { _ in sync() }
         .onChange(of: controller.configRevision) { _ in sync() }
         .onChange(of: controller.config.bindings[keyId]) { _ in
             // External change (paste/clear via context menu) → reload drafts.
@@ -89,22 +100,74 @@ struct KeyInspector: View {
 
             if !isDialModeKey {
                 HStack(spacing: 10) {
-                    Text("Name")
+                    Text("Binding name")
                         .font(.system(size: 11))
                         .foregroundColor(Graphite.text3)
-                    GraphiteField(placeholder: "binding name…", text: $nameDraft)
+                    GraphiteField(placeholder: "name this binding…", text: $nameDraft)
                         .frame(maxWidth: .infinity)
                         .disabled(!hasBinding)
-                        .onChange(of: nameDraft) { _ in scheduleNameSave() }
-                    Toggle("Enabled", isOn: $enabled)
+                        // Only arm the debounced save for USER edits. Programmatic
+                        // resets (sync() reloading values on key switch) also
+                        // fire onChange — arming those is exactly the "copied
+                        // settings" bug.
+                        .onChange(of: nameDraft) { _ in
+                            let stored = controller.config.bindingNames[keyId] ?? ""
+                            if nameDraft != stored {
+                                scheduleNameSave()
+                                controller.appendLog("_UClass arm name: closureKey=\(keyId) draft='\(nameDraft)' stored['\(keyId)']='\(stored)' selected=\(String(describing: controller.selectedControl))")
+                            } else {
+                                controller.appendLog("nameChg skip (matches key \(keyId))")
+                            }
+                        }
+                    Toggle("Enabled", isOn: Binding(
+                        get: { enabled },
+                        set: { v in
+                            enabled = v
+                            controller.setBindingEnabled(keyId, v)
+                        }))
                         .toggleStyle(.switch)
                         .controlSize(.mini)
                         .font(.system(size: 11))
                         .foregroundColor(Graphite.text2)
                         .disabled(!hasBinding)
-                        .onChange(of: enabled) { v in controller.setBindingEnabled(keyId, v) }
                 }
+            }
 
+            // Key-face text override. Optional: with the checkbox on, the
+            // binding name IS the key face; otherwise the custom text (if
+            // any) wins, else the hardware legend stays.
+            HStack(spacing: 10) {
+                Text("Display on key")
+                    .font(.system(size: 11))
+                    .foregroundColor(Graphite.text3)
+                GraphiteField(placeholder: "optional custom text…", text: $labelDraft)
+                    .frame(maxWidth: .infinity)
+                    .disabled(labelFromBindingDraft)
+                    // Same rule: user edits only — programmatic resets on key
+                    // switch must not arm saves.
+                    .onChange(of: labelDraft) { _ in
+                        let stored = controller.config.keyLabels[keyId] ?? ""
+                        if labelDraft != stored {
+                            scheduleLabelSave()
+                            controller.appendLog("labelChg arm: closureKey=\(keyId) draft='\(labelDraft)' stored['\(keyId)']='\(stored)' selected=\(String(describing: controller.selectedControl))")
+                        } else {
+                            controller.appendLog("labelChg skip (matches key \(keyId))")
+                        }
+                    }
+                Toggle("Name binding", isOn: $labelFromBindingDraft)
+                    .toggleStyle(.switch)
+                    .controlSize(.mini)
+                    .font(.system(size: 11))
+                    .foregroundColor(Graphite.text2)
+                    .help("Key face shows the binding name (updates when renamed)")
+                    .onChange(of: labelFromBindingDraft) { v in
+                        guard v != (controller.config.labelFromBinding[keyId] ?? false)
+                        else { return }
+                        controller.setKeyLabelFromBinding(keyId, v)
+                    }
+            }
+
+            if !isDialModeKey {
                 if key == .esc {
                     Text("ESC always force-releases an active hold — it is not rebindable on the Color page.")
                         .font(.system(size: 10))
@@ -123,11 +186,29 @@ struct KeyInspector: View {
             List {
                 Section("WHEN PRESSED") {
                     if draftPressed.isEmpty {
-                        Text(draftReleased.isEmpty
-                             ? "Unassigned — drag an action from the library onto the button, or use Add action."
-                             : "No press actions — the button only acts on release.")
-                            .font(.system(size: 11))
-                            .foregroundColor(Graphite.text3)
+                        if draftReleased.isEmpty {
+                            // Explicit empty state: unmistakable that this
+                            // binding is intentionally unassigned (not
+                            // blank/collapsed/not loaded).
+                            VStack(spacing: 7) {
+                                Image(systemName: "plus.circle.dashed")
+                                    .font(.system(size: 26))
+                                    .foregroundColor(dropActive
+                                        ? HWColor.selection : Graphite.text3)
+                                Text("No actions assigned")
+                                    .font(.system(size: 13, weight: .medium))
+                                    .foregroundColor(Graphite.text2)
+                                Text("Drag an action here or choose Add action below.")
+                                    .font(.system(size: 11))
+                                    .foregroundColor(Graphite.text3)
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 26)
+                        } else {
+                            Text("No press actions — the button only acts on release.")
+                                .font(.system(size: 11))
+                                .foregroundColor(Graphite.text3)
+                        }
                     }
                     ForEach(draftPressed.indices, id: \.self) { i in
                         ActionRow(controller: controller,
@@ -158,9 +239,22 @@ struct KeyInspector: View {
                 Section {
                     if showReleased || !draftReleased.isEmpty {
                         if draftReleased.isEmpty {
+                            // Empty state doubles as the drop target for the
+                            // FIRST release action (rows take over afterwards).
                             Text("No release actions — add one to run steps when the key is released.")
                                 .font(.system(size: 11))
-                                .foregroundColor(Graphite.text3)
+                                .foregroundColor(releasedDropActive ? HWColor.selection : Graphite.text3)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.vertical, 10)
+                                .contentShape(Rectangle())
+                                .onDrop(of: [UTType.plainText], isTargeted: $releasedDropActive) { providers in
+                                    let defaultTarget = controller.config.targets.keys.sorted().first
+                                    return ActionDrop.step(from: providers.first ?? NSItemProvider(),
+                                                           defaultTarget: defaultTarget) { new in
+                                        guard let new else { return }
+                                        appendReleasedAction(new)
+                                    }
+                                }
                         }
                         ForEach(draftReleased.indices, id: \.self) { i in
                             ActionRow(controller: controller,
@@ -186,6 +280,24 @@ struct KeyInspector: View {
                             draftReleased.remove(atOffsets: offsets)
                             commitReleased()
                         }
+                        HStack(spacing: 8) {
+                            Menu {
+                                ForEach(ActionCatalog.all) { item in
+                                    Button(item.label) {
+                                        appendReleasedAction(ActionCatalog.newStep(forType: item.id,
+                                                                                   defaultTarget: controller.config.targets.keys.sorted().first))
+                                    }
+                                }
+                            } label: {
+                                Label("Add release action", systemImage: "plus")
+                                    .font(.system(size: 11, weight: .medium))
+                                    .foregroundColor(Graphite.text2)
+                            }
+                            .menuStyle(.borderlessButton)
+                            .fixedSize()
+                            Spacer()
+                        }
+                        .padding(.vertical, 2)
                     } else {
                         Button {
                             showReleased = true
@@ -250,18 +362,40 @@ struct KeyInspector: View {
     // MARK: Drafts & commits
 
     private func sync() {
+        controller.appendLog("sync \(key.id) editor=\(editorKey?.id ?? "nil") p=\((controller.config.bindings[keyId] ?? []).count)")
         draftPressed = controller.config.bindings[keyId] ?? []
         draftReleased = controller.config.released[keyId] ?? []
+        editorKey = key
         nameDraft = controller.config.bindingNames[keyId] ?? ""
+        labelDraft = controller.config.keyLabels[keyId] ?? ""
+        labelFromBindingDraft = controller.config.labelFromBinding[keyId] ?? false
         enabled = !disabledBinding
-        showReleased = !draftReleased.isEmpty
+        // Whether the released phase is visible is a user preference
+        // (persisted), not per-key data: forcing it here would re-collapse
+        // it on every key switch — and the `!draftReleased.isEmpty` clause in
+        // the section condition auto-expands keys that have release steps.
     }
 
+    @State private var editorKey: SpeedEditorKey?
+
     private func commitPressed() {
+        // Cross-key safety: SwiftUI can fire a control's binding setter
+        // (formatters on TextField, in particular) during the first re-layout
+        // after the selection changes — with drafts still holding the
+        // previous key's rows. Refuse any commit whose drafts belong to a
+        // different key than the one being edited now.
+        guard editorKey == key else {
+            controller.appendLog("⚠️ refused stale commit for \(keyId) (editing \(editorKey?.id ?? "nothing"))")
+            return
+        }
         controller.setBinding(keyId, phase: .pressed, draftPressed)
     }
 
     private func commitReleased() {
+        guard editorKey == key else {
+            controller.appendLog("⚠️ refused stale commit for \(keyId) (editing \(editorKey?.id ?? "nothing"))")
+            return
+        }
         controller.setBinding(keyId, phase: .released, draftReleased)
     }
 
@@ -271,12 +405,40 @@ struct KeyInspector: View {
         commitPressed()
     }
 
+    /// Appends a fully-built step to the RELEASED sequence. The released
+    /// section exposes this through its own "Add release action" menu and as
+    /// the drop target for the first release step — the footer add-menu stays
+    /// pressed-phase only.
+    private func appendReleasedAction(_ step: MacroStep) {
+        showReleased = true
+        draftReleased.append(step)
+        commitReleased()
+    }
+
     private func scheduleNameSave() {
         nameSaveWork?.cancel()
+        // Snapshot BOTH the key id and the draft: the work item executes 0.5 s
+        // later — possibly after the user has already selected another key —
+        // so late-binding `keyId`/`nameDraft` would write A's text onto B.
+        let scheduledKeyId = keyId
+        let draft = nameDraft
         let work = DispatchWorkItem { [weak controller] in
-            controller?.setBindingName(keyId, nameDraft)
+            controller?.appendLog("exec nameSave \(scheduledKeyId) '\(draft)'")
+            controller?.setBindingName(scheduledKeyId, draft)
         }
         nameSaveWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
+    }
+
+    private func scheduleLabelSave() {
+        labelSaveWork?.cancel()
+        let scheduledKeyId = keyId
+        let draft = labelDraft
+        let work = DispatchWorkItem { [weak controller] in
+            controller?.appendLog("exec labelSave \(scheduledKeyId) '\(draft)'")
+            controller?.setKeyLabel(scheduledKeyId, draft)
+        }
+        labelSaveWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
     }
 
@@ -309,6 +471,22 @@ struct ActionRow: View {
     let onInsertAfter: (MacroStep) -> Void
 
     @State private var hovered = false
+    @State private var rowDropActive = false
+
+    private var rowFill: Color {
+        if error != nil { return Graphite.red.opacity(0.12) }
+        if active { return Graphite.amber.opacity(0.14) }
+        if rowDropActive { return HWColor.selection.opacity(0.15) }
+        if hovered { return Graphite.control.opacity(0.85) }
+        return Graphite.control.opacity(0.5)
+    }
+
+    private var rowStroke: Color {
+        if error != nil { return Graphite.red.opacity(0.7) }
+        if active { return Graphite.amber }
+        if rowDropActive { return HWColor.selection }
+        return Graphite.border.opacity(0.6)
+    }
 
     var body: some View {
         VStack(spacing: 2) {
@@ -357,7 +535,7 @@ struct ActionRow: View {
                 .stroke(rowStroke, lineWidth: active ? 1.5 : 1)
         )
         .onHover { hovered = $0 }
-        .onDrop(of: [UTType.plainText], isTargeted: nil) { providers in
+        .onDrop(of: [UTType.plainText], isTargeted: $rowDropActive) { providers in
             // Dropping an action onto a row inserts AFTER it.
             let defaultTarget = controller.config.targets.keys.sorted().first
             return ActionDrop.step(from: providers.first ?? NSItemProvider(),
@@ -366,19 +544,6 @@ struct ActionRow: View {
                 onInsertAfter(new)
             }
         }
-    }
-
-    private var rowFill: Color {
-        if error != nil { return Graphite.red.opacity(0.12) }
-        if active { return Graphite.amber.opacity(0.14) }
-        if hovered { return Graphite.control.opacity(0.85) }
-        return Graphite.control.opacity(0.5)
-    }
-
-    private var rowStroke: Color {
-        if error != nil { return Graphite.red.opacity(0.7) }
-        if active { return Graphite.amber }
-        return Graphite.border.opacity(0.6)
     }
 
     @ViewBuilder
@@ -394,7 +559,92 @@ struct ActionRow: View {
                 }
             }
         case "click":
-            Text("at current position")
+            HStack(spacing: 6) {
+                Menu {
+                    ForEach(MouseController.HWButton.allCases, id: \.rawValue) { b in
+                        Button(buttonLabel(b)) { step.button = b.rawValue }
+                    }
+                } label: {
+                    stepChip(buttonLabel(MouseController.HWButton(rawValue: step.button ?? 0) ?? .left))
+                }
+                .controlSize(.mini)
+                Picker("", selection: Binding(
+                    get: { step.count ?? 1 },
+                    set: { step.count = $0 })) {
+                    Text("single").tag(1)
+                    Text("double").tag(2)
+                    Text("triple").tag(3)
+                }
+                .controlSize(.mini)
+                .pickerStyle(.segmented)
+            }
+        case "clicktarget", "cycletarget":
+            HStack(spacing: 5) {
+                TargetMenuButton(controller: controller, step: $step)
+                if step.type == "clicktarget" {
+                    Menu {
+                        ForEach(MouseController.HWButton.allCases, id: \.rawValue) { b in
+                            Button(buttonLabel(b)) { step.button = b.rawValue }
+                        }
+                    } label: {
+                        stepChip(buttonLabel(MouseController.HWButton(rawValue: step.button ?? 0) ?? .left))
+                    }
+                    .controlSize(.mini)
+                }
+                if controller.config.targets[step.target ?? ""] == nil && step.type != "cycletarget" {
+                    Text("(uncalibrated)")
+                        .font(.system(size: 9.5))
+                        .foregroundColor(Graphite.amber)
+                }
+            }
+        case "mousedown", "mouseup":
+            Menu {
+                ForEach(MouseController.HWButton.allCases, id: \.rawValue) { b in
+                    Button(buttonLabel(b)) { step.button = b.rawValue }
+                }
+            } label: {
+                stepChip(buttonLabel(MouseController.HWButton(rawValue: step.button ?? 0) ?? .left))
+            }
+            .controlSize(.mini)
+        case "moveby", "dragby", "scroll":
+            HStack(spacing: 4) {
+                if step.type == "scroll" {
+                    TextField("lines", value: dyBinding, formatter: NumberFormatter())
+                        .textFieldStyle(.roundedBorder)
+                        .controlSize(.small)
+                        .frame(width: 52)
+                    Text("lines (− down, + up)")
+                        .font(.system(size: 10))
+                        .foregroundColor(Graphite.text3)
+                } else {
+                    TextField("x", value: dxBinding, formatter: NumberFormatter())
+                        .textFieldStyle(.roundedBorder)
+                        .controlSize(.small)
+                        .frame(width: 52)
+                    TextField("y", value: dyBinding, formatter: NumberFormatter())
+                        .textFieldStyle(.roundedBorder)
+                        .controlSize(.small)
+                        .frame(width: 52)
+                    Text("px")
+                        .font(.system(size: 10))
+                        .foregroundColor(Graphite.text3)
+                }
+            }
+        case "sens":
+            HStack(spacing: 4) {
+                TextField("%", value: msBinding, formatter: NumberFormatter())
+                    .textFieldStyle(.roundedBorder)
+                    .controlSize(.small)
+                    .frame(width: 52)
+                Text("% of normal drag speed (100 = normal)")
+                    .font(.system(size: 10))
+                    .foregroundColor(Graphite.text3)
+            }
+        case "savepos", "restorepos", "releaseall":
+            EmptyView()
+        case "keydown", "keyup":
+            KeyCaptureButton(step: $step)
+            Text("pair down ↔ up via the release phase")
                 .font(.system(size: 10))
                 .foregroundColor(Graphite.text3)
         case "hold":
@@ -424,6 +674,33 @@ struct ActionRow: View {
         Binding(
             get: { step.ms ?? 200 },
             set: { step.ms = max(0, min($0, 2000)) })
+    }
+
+    private var dxBinding: Binding<Int> {
+        Binding(get: { step.dx ?? 0 }, set: { step.dx = $0 })
+    }
+
+    private var dyBinding: Binding<Int> {
+        Binding(get: { step.dy ?? 0 }, set: { step.dy = $0 })
+    }
+
+    private func buttonLabel(_ b: MouseController.HWButton) -> String {
+        switch b {
+        case .left: return "left"
+        case .right: return "right"
+        case .middle: return "middle"
+        }
+    }
+
+    /// Tiny selectable chip for enum-ish step settings.
+    private func stepChip(_ text: String) -> some View {
+        Text(text)
+            .font(.system(size: 11))
+            .foregroundColor(Graphite.text)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background(RoundedRectangle(cornerRadius: 4).fill(Graphite.control))
+            .overlay(RoundedRectangle(cornerRadius: 4).stroke(Graphite.border, lineWidth: 1))
     }
 }
 

@@ -16,18 +16,33 @@
 import Foundation
 
 public struct MacroStep: Codable, Equatable {
-    public var type: String    // "goto" | "click" | "hold" | "key" | "wait"
+    public var type: String    // "goto" | "click" | "hold" | "key" | "wait" | … (see describe)
     public var target: String?
     public var keyCode: Int?
     public var flags: Int?
     public var ms: Int?
+    /// Mouse button (click / mousedown / mouseup / clicktarget): 0=left 1=right 2=middle.
+    public var button: Int?
+    /// Click count (1 single, 2 double, replaces a separate double-click step type).
+    public var count: Int?
+    /// Relative pixel offsets for moveby / dragby / scroll.
+    public var dx: Int?
+    public var dy: Int?
+    /// Target list for "cycletarget" (falls back to all calibrated targets).
+    public var list: [String]?
 
-    public init(type: String, target: String? = nil, keyCode: Int? = nil, flags: Int? = nil, ms: Int? = nil) {
+    public init(type: String, target: String? = nil, keyCode: Int? = nil, flags: Int? = nil, ms: Int? = nil,
+                button: Int? = nil, count: Int? = nil, dx: Int? = nil, dy: Int? = nil, list: [String]? = nil) {
         self.type = type
         self.target = target
         self.keyCode = keyCode
         self.flags = flags
         self.ms = ms
+        self.button = button
+        self.count = count
+        self.dx = dx
+        self.dy = dy
+        self.list = list
     }
 
     public static func goto(_ name: String) -> MacroStep { MacroStep(type: "goto", target: name) }
@@ -36,10 +51,24 @@ public struct MacroStep: Codable, Equatable {
     public static func key(_ code: Int, _ flags: Int = 0) -> MacroStep { MacroStep(type: "key", keyCode: code, flags: flags) }
     public static func wait(_ ms: Int) -> MacroStep { MacroStep(type: "wait", ms: ms) }
 
+    /// Human button name for diagnostics/labels.
+    public static func buttonName(_ raw: Int?) -> String {
+        switch raw ?? 0 {
+        case 1: return "right"
+        case 2: return "middle"
+        default: return "left"
+        }
+    }
+
     public var describe: String {
         switch type {
         case "goto": return "go to \(target ?? "?")"
-        case "click": return "click"
+        case "click":
+            let n = count ?? 1
+            let clicks = n == 1 ? "" : (n == 2 ? " double" : " ×\(n)")
+            let btn = (button ?? 0) == 0 ? "" : " \(Self.buttonName(button))-button"
+            return "click\(clicks)\(btn)"
+        case "clicktarget": return "click \(target ?? "?") (\(Self.buttonName(button)))"
         case "hold": return "hold (dial drags)"
         case "key":
             let f = Int(flags ?? 0)
@@ -50,8 +79,29 @@ public struct MacroStep: Codable, Equatable {
             if f & 1 << 18 != 0 { mods += "⌃" }   // kCGEventFlagMaskControl
             return "key \(mods)\(KeyEventNames.name(for: UInt16(keyCode ?? 0)))"
         case "wait": return "wait \(ms ?? 0) ms"
+        case "savepos": return "save cursor position"
+        case "restorepos": return "restore cursor position"
+        case "moveby": return "move cursor by (\(dx ?? 0), \(dy ?? 0)) px"
+        case "dragby": return "drag by (\(dx ?? 0), \(dy ?? 0)) px"
+        case "scroll": return "scroll \(dy ?? 0) lines"
+        case "mousedown": return "\(Self.buttonName(button)) mouse down"
+        case "mouseup": return "\(Self.buttonName(button)) mouse up"
+        case "keydown": return "key down \(KeyEventNames.name(for: UInt16(keyCode ?? 0)))"
+        case "keyup": return "key up \(KeyEventNames.name(for: UInt16(keyCode ?? 0)))"
+        case "sens": return "dial sensitivity \(sensPercent)%"
+        case "cycletarget": return "cycle targets (\(cycleList.count))"
+        case "releaseall": return "release all held inputs"
         default: return type
         }
+    }
+
+    /// Sensitivity factor in percent (1–1000).
+    public var sensPercent: Int { min(max(ms ?? 100, 1), 1000) }
+
+    /// Resolved target list for cycletarget.
+    public var cycleList: [String] {
+        let l = (list ?? []).filter { !$0.isEmpty }
+        return l
     }
 }
 

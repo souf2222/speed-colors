@@ -84,6 +84,8 @@ public struct ColorModeConfig: Codable {
     public var wheelLabelDrop: Double
     /// Jog units per arrow tap on non-Color pages (nil = daemon default 800).
     public var jogUnitsPerArrow: Int?
+    /// Target ids pinned to the top of the Targets list (global, like targets).
+    public var favoriteTargets: [String]
     /// Which profile's data the flat fields currently hold.
     public var activeProfile: String
     /// Optional app association (bundle ids) per profile. No auto-switching yet.
@@ -104,6 +106,15 @@ public struct ColorModeConfig: Codable {
     public var dialSensitivity: [String: Int]
     /// Custom display names per binding (SE key id → name).
     public var bindingNames: [String: String]
+    /// Custom face labels per SE key id — what the hardware replica prints on
+    /// the key (empty/unset = original hardware legend).
+    public var keyLabels: [String: String]
+    /// User-created targets (id → display label). Calibrated positions live
+    /// in `targets` (only when actually captured); this holds the identity so
+    /// planned-but-uncalibrated custom targets still appear in the library.
+    public var customTargets: [String: String]
+    /// Keys whose face legend follows their binding name (inspectable toggle).
+    public var labelFromBinding: [String: Bool]
     /// Bindings turned off (SE key ids) — exist but never fire.
     public var disabledBindings: [String]
 
@@ -116,9 +127,13 @@ public struct ColorModeConfig: Codable {
                 released: [String: [MacroStep]]? = nil,
                 dialSensitivity: [String: Int]? = nil,
                 bindingNames: [String: String]? = nil,
+                keyLabels: [String: String]? = nil,
+                customTargets: [String: String]? = nil,
+                labelFromBinding: [String: Bool]? = nil,
                 disabledBindings: [String]? = nil,
                 activeProfile: String? = nil,
-                profileApps: [String: [String]]? = nil) {
+                profileApps: [String: [String]]? = nil,
+                favoriteTargets: [String]? = nil) {
         self.targets = targets
         self.pixelsPerUnit = pixelsPerUnit
         self.dragReleaseIdle = dragReleaseIdle
@@ -128,9 +143,13 @@ public struct ColorModeConfig: Codable {
         self.released = released ?? [:]
         self.dialSensitivity = dialSensitivity ?? [:]
         self.bindingNames = bindingNames ?? [:]
+        self.keyLabels = keyLabels ?? [:]
+        self.customTargets = customTargets ?? [:]
+        self.labelFromBinding = labelFromBinding ?? [:]
         self.disabledBindings = disabledBindings ?? []
         self.activeProfile = activeProfile ?? Self.defaultProfile
         self.profileApps = profileApps ?? [:]
+        self.favoriteTargets = favoriteTargets ?? []
         storedProfiles = [:]
     }
 
@@ -140,8 +159,8 @@ public struct ColorModeConfig: Codable {
 
     private enum CodingKeys: String, CodingKey {
         case targets, pixelsPerUnit, dragReleaseIdle, wheelLabelDrop, bindings, jogUnitsPerArrow
-        case released, dialSensitivity, bindingNames, disabledBindings
-        case activeProfile, profileApps, storedProfiles
+        case released, dialSensitivity, bindingNames, keyLabels, customTargets, labelFromBinding, disabledBindings
+        case activeProfile, profileApps, storedProfiles, favoriteTargets
     }
 
     public init(from decoder: Decoder) throws {
@@ -156,10 +175,21 @@ public struct ColorModeConfig: Codable {
         released = try c.decodeIfPresent([String: [MacroStep]].self, forKey: .released) ?? [:]
         dialSensitivity = try c.decodeIfPresent([String: Int].self, forKey: .dialSensitivity) ?? [:]
         bindingNames = try c.decodeIfPresent([String: String].self, forKey: .bindingNames) ?? [:]
+        keyLabels = try c.decodeIfPresent([String: String].self, forKey: .keyLabels) ?? [:]
+        customTargets = try c.decodeIfPresent([String: String].self, forKey: .customTargets) ?? [:]
+        labelFromBinding = try c.decodeIfPresent([String: Bool].self, forKey: .labelFromBinding) ?? [:]
         disabledBindings = try c.decodeIfPresent([String].self, forKey: .disabledBindings) ?? []
+        // Legacy configs have calibrated custom targets with no metadata —
+        // fold them in so they stay listed (and renamable).
+        var mergedCustoms = customTargets
+        for k in targets.keys where TargetCatalog.entry(for: k) == nil && mergedCustoms[k] == nil {
+            mergedCustoms[k] = k
+        }
+        customTargets = mergedCustoms
         activeProfile = try c.decodeIfPresent(String.self, forKey: .activeProfile) ?? Self.defaultProfile
         profileApps = try c.decodeIfPresent([String: [String]].self, forKey: .profileApps) ?? [:]
         storedProfiles = try c.decodeIfPresent([String: StoredProfile].self, forKey: .storedProfiles) ?? [:]
+        favoriteTargets = try c.decodeIfPresent([String].self, forKey: .favoriteTargets) ?? []
     }
 
     // MARK: Profiles
@@ -279,6 +309,15 @@ public struct ColorModeConfig: Codable {
             print("· migrated legacy wheel targets → wheel_1_color … wheel_4_color")
             fflush(stdout)
         }
+        // HDR has zone-based controls (Black/Dark/Shadow/…), not four wheels;
+        // drop stale calibrations for the removed lift/gamma/gain/offset ids.
+        let dead = cfg.targets.keys.filter { TargetCatalog.deprecatedIds.contains($0) }
+        if !dead.isEmpty {
+            for id in dead { cfg.targets[id] = nil }
+            try? cfg.save()
+            print("· removed deprecated HDR wheel calibrations (HDR is zone-based): \(dead.joined(separator: ", "))")
+            fflush(stdout)
+        }
         return cfg
     }
 
@@ -318,14 +357,37 @@ public struct ColorModeConfig: Codable {
     }
 
     public mutating func removeTarget(named name: String) -> Bool {
-        guard targets[name] != nil else { return false }
+        let hadPoint = targets[name] != nil
+        let hadCustom = customTargets[name] != nil
+        guard hadPoint || hadCustom else { return false }
         targets[name] = nil
+        customTargets[name] = nil
         return true
     }
 
     /// Human-readable label for a target id (catalog name or the raw id).
     public func targetLabel(_ id: String) -> String {
-        TargetCatalog.label(for: id) ?? id
+        customTargets[id] ?? TargetCatalog.label(for: id) ?? id
+    }
+
+    // MARK: Custom targets
+
+    /// Registers a user-defined target identity (starts uncalibrated unless a
+    /// calibration point is stored under the same id separately).
+    public mutating func addCustomTarget(id: String, label: String) {
+        customTargets[id] = label
+    }
+
+    /// A target id is usable if it's in the built-in catalog or user-created.
+    public func isKnownTarget(_ id: String) -> Bool {
+        TargetCatalog.entry(for: id) != nil || customTargets[id] != nil
+    }
+
+    /// All custom target ids, sorted (calibrated or planned).
+    public var customTargetIds: [String] {
+        var ids = Set(customTargets.keys)
+        ids.formUnion(targets.keys.filter { TargetCatalog.entry(for: $0) == nil })
+        return ids.sorted()
     }
 
     /// Where a target is referenced — for the delete-confirmation UI.
@@ -359,15 +421,20 @@ public struct ColorModeConfig: Codable {
     /// and every stored profile).
     @discardableResult
     public mutating func renameTarget(_ old: String, to new: String) -> Bool {
-        guard targets[old] != nil, targets[new] == nil, !new.isEmpty else { return false }
+        guard !new.isEmpty, targets[new] == nil, customTargets[new] == nil,
+              TargetCatalog.entry(for: new) == nil else { return false }
+        guard targets[old] != nil || customTargets[old] != nil else { return false }
+        // Copy the point across (if calibrated); both maps stay consistent.
         targets[new] = targets[old]
         targets[old] = nil
+        customTargets[new] = customTargets[old] ?? new
+        customTargets[old] = nil
 
         func retarget(_ steps: [MacroStep]) -> [MacroStep] {
             steps.map { s in
-                s.target == old
-                    ? MacroStep(type: s.type, target: new, keyCode: s.keyCode, flags: s.flags, ms: s.ms)
-                    : s
+                var s = s
+                if s.target == old { s.target = new }
+                return s
             }
         }
         for (k, steps) in bindings { bindings[k] = retarget(steps) }

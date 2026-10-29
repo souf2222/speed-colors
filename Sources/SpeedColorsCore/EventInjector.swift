@@ -66,6 +66,35 @@ public enum EventInjector {
         AXIsProcessTrusted()
     }
 
+    /// Chorded key DOWN only (modifiers pressed first, held). Pair with
+    /// `chordUp` — for "hold shortcut while pressed" bindings.
+    public static func chordDown(_ keyCode: CGKeyCode, flags: CGEventFlags = [], toPid pid: pid_t? = nil) {
+        let mods = modifierKeyCodes.filter { flags.contains(CGEventFlags(rawValue: $0.flag)) }
+        for m in mods {
+            guard let e = CGEvent(keyboardEventSource: nil, virtualKey: m.code, keyDown: true) else { continue }
+            e.flags = flags
+            post(e, toPid: pid)
+        }
+        if !mods.isEmpty { usleep(24_000) }
+        guard let down = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: true) else { return }
+        down.flags = flags
+        post(down, toPid: pid)
+    }
+
+    /// Chorded key UP (complement of `chordDown`).
+    public static func chordUp(_ keyCode: CGKeyCode, flags: CGEventFlags = [], toPid pid: pid_t? = nil) {
+        guard let up = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: false) else { return }
+        up.flags = flags
+        post(up, toPid: pid)
+        let mods = modifierKeyCodes.filter { flags.contains(CGEventFlags(rawValue: $0.flag)) }
+        usleep(24_000)
+        for m in mods.reversed() {
+            guard let e = CGEvent(keyboardEventSource: nil, virtualKey: m.code, keyDown: false) else { continue }
+            e.flags = []
+            post(e, toPid: pid)
+        }
+    }
+
     public static let accessibilityInstructions = """
     ⚠️  Accessibility permission required.
         System Settings → Privacy & Security → Accessibility

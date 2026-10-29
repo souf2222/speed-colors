@@ -17,7 +17,10 @@ struct TargetPicker: View {
     private struct Row: Identifiable {
         let id: String
         let label: String
+        let name: String
+        let parentPath: String
         let group: String
+        let type: TargetType?
         let calibrated: Bool
     }
 
@@ -25,15 +28,17 @@ struct TargetPicker: View {
         var out: [Row] = []
         let q = query.lowercased()
         for e in TargetCatalog.all {
-            if q.isEmpty || e.id.lowercased().contains(q) || e.label.lowercased().contains(q) {
-                out.append(Row(id: e.id, label: e.label, group: e.group,
+            if q.isEmpty || e.fullPath.lowercased().contains(q) || e.id.lowercased().contains(q) {
+                out.append(Row(id: e.id, label: e.fullPath, name: e.name, parentPath: e.parentPath,
+                               group: e.topGroup, type: e.type,
                                calibrated: controller.config.targets[e.id] != nil))
             }
         }
         // Custom (non-catalog) calibrated targets, e.g. from `coords --save`.
         for id in controller.config.targets.keys.sorted() where TargetCatalog.label(for: id) == nil {
             if q.isEmpty || id.lowercased().contains(q) {
-                out.append(Row(id: id, label: id, group: "Calibrated (custom)", calibrated: true))
+                out.append(Row(id: id, label: id, name: id, parentPath: "custom", group: "Custom",
+                               type: nil, calibrated: true))
             }
         }
         return out
@@ -77,16 +82,16 @@ struct TargetPicker: View {
                                 onSelect(row.id)
                             } label: {
                                 HStack(spacing: 6) {
-                                    Circle()
-                                        .fill(row.calibrated ? Graphite.cyan : Graphite.text3.opacity(0.4))
-                                        .frame(width: 5, height: 5)
+                                    TargetTypeIcon(type: row.type, calibrated: row.calibrated)
+                                        .frame(width: 12)
                                     VStack(alignment: .leading, spacing: 0) {
-                                        Text(row.label)
+                                        Text(row.name)
                                             .font(.system(size: 12))
                                             .foregroundColor(Graphite.text)
-                                        Text(row.id)
-                                            .font(.system(size: 9).monospaced())
+                                        Text(row.parentPath)
+                                            .font(.system(size: 9))
                                             .foregroundColor(Graphite.text3)
+                                            .lineLimit(1)
                                     }
                                     Spacer()
                                     if !row.calibrated {

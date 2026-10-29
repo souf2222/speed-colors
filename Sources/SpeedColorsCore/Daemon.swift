@@ -69,6 +69,11 @@ public final class SpeedColorsDaemon {
         migrateBindings()
     }
 
+    /// Saved cursor position (savepos/restorepos steps), one slot per daemon.
+    private var savedColorPoint: CGPoint?
+    /// Dial sensitivity multiplier in percent (100 = neutral; sens steps).
+    private(set) var sensFactor: Int = 100
+
     /// First run against a pre-bindings config: synthesize the proven defaults.
     /// Only for a virgin Default profile — a deliberately empty user profile
     /// must stay empty.
@@ -297,11 +302,45 @@ public final class SpeedColorsDaemon {
                 usleep(20_000)
                 lastColorPoint = t.point
                 heldTargetLabel = colorConfig.targetLabel(name)
+            case "clicktarget":
+                guard let name = step.target,
+                      let t = colorConfig.targets[name] else {
+                    log("🎨   ✗ click '\(step.target ?? "?")' — target not calibrated")
+                    continue
+                }
+                MouseController.click(at: t.point,
+                                      button: MouseController.HWButton(rawValue: step.button ?? 0) ?? .left,
+                                      count: step.count ?? 1)
+                usleep(20_000)
+                lastColorPoint = t.point
+                heldTargetLabel = colorConfig.targetLabel(name)
             case "click":
                 let p = lastColorPoint ?? MouseController.currentPosition()
-                MouseController.down(at: p)
-                usleep(40_000)
-                MouseController.up(at: p)
+                MouseController.click(at: p,
+                                      button: MouseController.HWButton(rawValue: step.button ?? 0) ?? .left,
+                                      count: step.count ?? 1)
+            case "mousedown":
+                let p = lastColorPoint ?? MouseController.currentPosition()
+                let btn = MouseController.HWButton(rawValue: step.button ?? 0) ?? .left
+                if btn == .left && mouseDownPoint == nil {
+                    MouseController.down(at: p)
+                    mouseDownPoint = p
+                    downPoint = p
+                    dragSteps = 0
+                    heldColorKey = key
+                    heldColorPoint = p
+                    notifyDialState()
+                } else {
+                    MouseController.down(at: p, button: btn)
+                }
+            case "mouseup":
+                let p = MouseController.currentPosition()
+                let btn = MouseController.HWButton(rawValue: step.button ?? 0) ?? .left
+                if btn == .left && mouseDownPoint != nil {
+                    disarmColor()
+                } else {
+                    MouseController.up(at: p, button: btn)
+                }
             case "hold":
                 let p = lastColorPoint ?? MouseController.currentPosition()
                 if releasePhase {
@@ -320,6 +359,82 @@ public final class SpeedColorsDaemon {
                     heldColorPoint = p
                     notifyDialState()
                 }
+            case "moveby":
+                MouseController.moveBy(dx: step.dx ?? 0, dy: step.dy ?? 0)
+                usleep(20_000)
+            case "dragby":
+                // One-shot drag by an offset from the current position.
+                var p = MouseController.currentPosition()
+                MouseController.down(at: p)
+                usleep(25_000)
+                let screen = MouseController.screenSize
+                let increments = 6
+                let ddx = CGFloat(step.dx ?? 0) / CGFloat(increments)
+                let ddy = CGFloat(step.dy ?? 0) / CGFloat(increments)
+                for _ in 0..<increments {
+                    p = MouseController.currentPosition()
+                    p.x = min(max(p.x + ddx, 0), screen.width - 1)
+                    p.y = min(max(p.y + ddy, 0), screen.height - 1)
+                    MouseController.drag(to: p)
+                    usleep(12_000)
+                }
+                MouseController.up(at: MouseController.currentPosition(), pressed: true)
+            case "scroll":
+                let n = abs(step.dy ?? 1)
+                let direction = (step.dy ?? 0) > 0 ? 1 : -1  // dy > 0 = scroll up
+                for _ in 0..<max(1, n) {
+                    MouseController.scroll(dy: direction)
+                    usleep(30_000)
+                }
+                log("🎨   scroll: \(step.describe)")
+            case "savepos":
+                savedColorPoint = MouseController.currentPosition()
+            case "restorepos":
+                if let p = savedColorPoint {
+                    MouseController.move(to: p)
+                    usleep(20_000)
+                } else {
+                    log("🎨   ✗ restorepos — nothing saved yet")
+                }
+            case "sens":
+                sensFactor = step.sensPercent
+                if releasePhase || step.sensPercent == 100 {
+                    log("🎨   dial sensitivity ×\(sensFactor)")
+                } else {
+                    log("🎨   dial sensitivity ×\(sensFactor) while held (reset via sens 100 on release)")
+                }
+            case "cycletarget":
+                let list: [String]
+                if !step.cycleList.isEmpty {
+                    list = step.cycleList
+                } else {
+                    list = colorConfig.targets.keys.filter { TargetCatalog.entry(for: $0) != nil || true }.sorted()
+                }
+                if list.isEmpty {
+                    log("🎨   ✗ cycletarget — no targets")
+                    continue
+                }
+                var idx = lastCycledName.flatMap { list.firstIndex(of: $0) }.map { $0 + 1 } ?? 0
+                if idx >= list.count { idx = 0 }
+                let name = list[idx]
+                lastCycledName = name
+                if let t = colorConfig.targets[name] {
+                    MouseController.move(to: t.point)
+                    usleep(20_000)
+                    lastColorPoint = t.point
+                    heldTargetLabel = colorConfig.targetLabel(name)
+                    log("🎨   cycle → \(colorConfig.targetLabel(name))")
+                } else {
+                    log("🎨   ✗ cycletarget '\(name)' — not calibrated")
+                }
+            case "releaseall":
+                disarmColor()
+                if let p = savedColorPoint {
+                    MouseController.move(to: p)
+                    usleep(20_000)
+                }
+                sensFactor = 100
+                log("🎨 released all app-held inputs")
             case "key":
                 guard let codeInt = step.keyCode else {
                     log("🎨   ✗ key step not captured — click its button and press the combo")
@@ -330,6 +445,28 @@ public final class SpeedColorsDaemon {
                     flags: CGEventFlags(rawValue: UInt64(step.flags ?? 0)),
                     toPid: pid)
                 log("⌨️  \(step.describe)")
+            case "keydown":
+                guard let codeInt = step.keyCode else {
+                    log("🎨   ✗ key down not captured")
+                    continue
+                }
+                EventInjector.chordDown(
+                    CGKeyCode(truncatingIfNeeded: codeInt),
+                    flags: CGEventFlags(rawValue: UInt64(step.flags ?? 0)),
+                    toPid: pid)
+                heldKeyChord = (CGKeyCode(truncatingIfNeeded: codeInt), step.flags ?? 0)
+                log("⌨️  down \(step.describe)")
+            case "keyup":
+                guard let codeInt = step.keyCode else {
+                    log("🎨   ✗ key up not captured")
+                    continue
+                }
+                EventInjector.chordUp(
+                    CGKeyCode(truncatingIfNeeded: codeInt),
+                    flags: CGEventFlags(rawValue: UInt64(step.flags ?? 0)),
+                    toPid: pid)
+                if heldKeyChord?.0 == CGKeyCode(truncatingIfNeeded: codeInt) { heldKeyChord = nil }
+                log("⌨️  up \(step.describe)")
             case "wait":
                 usleep(UInt32(min(max(step.ms ?? 0, 0), 2_000)) * 1_000)
             default:
@@ -337,6 +474,13 @@ public final class SpeedColorsDaemon {
             }
         }
     }
+
+    /// Track the last actively held keyboard chord so emergency cleanup can
+    /// release it even when the binding has no release-phase keyup step.
+    private var heldKeyChord: (CGKeyCode, Int)?
+
+    /// Last target name visited by a cycletarget step (resume point for the cycle).
+    private var lastCycledName: String?
 
     private func endHeldDrag() {
         disarmColor()
@@ -358,6 +502,13 @@ public final class SpeedColorsDaemon {
             let dp = downPoint.map { "(\(Int($0.x)), \(Int($0.y)))" } ?? "?"
             log("🎨 mouse up at (\(Int(p.x)), \(Int(p.y)))  [down \(dp) · \(dragSteps) drag steps]")
         }
+        // Emergency hygiene: never leave a synthetic chord held.
+        if let (code, flags) = heldKeyChord {
+            EventInjector.chordUp(code, flags: CGEventFlags(rawValue: UInt64(flags)),
+                                  toPid: resolvePid())
+            heldKeyChord = nil
+        }
+        sensFactor = 100
         mouseDownPoint = nil
         heldColorKey = nil
         heldColorPoint = nil
@@ -385,8 +536,10 @@ public final class SpeedColorsDaemon {
             downPoint = p
             usleep(25_000)
         }
-        // Clockwise (positive) = up = increase.
+        // Clockwise (positive) = up = increase. sensFactor scales the drag
+        // sensitivity temporarily (sens steps set it; disarm resets to 100).
         let dy = Double(-delta * sens) * colorConfig.pixelsPerUnit
+            * (Double(sensFactor) / 100.0)
         p.y = min(max(p.y + dy, 0), screen.height)
         MouseController.drag(to: p)
         mouseDownPoint = p
@@ -417,11 +570,72 @@ public final class SpeedColorsDaemon {
                     MouseController.move(to: t.point)
                     usleep(20_000)
                     last = t.point
+                case "clicktarget":
+                    guard let name = step.target, let t = colorConfig.targets[name] else {
+                        err = "target '\(step.target ?? "?")' not calibrated"
+                        break
+                    }
+                    MouseController.click(at: t.point,
+                                          button: MouseController.HWButton(rawValue: step.button ?? 0) ?? .left,
+                                          count: step.count ?? 1)
+                    last = t.point
+                    usleep(20_000)
                 case "click":
                     let p = last ?? MouseController.currentPosition()
+                    MouseController.click(at: p,
+                                          button: MouseController.HWButton(rawValue: step.button ?? 0) ?? .left,
+                                          count: step.count ?? 1)
+                case "mousedown":
+                    let p = last ?? MouseController.currentPosition()
+                    MouseController.down(at: p, button: MouseController.HWButton(rawValue: step.button ?? 0) ?? .left)
+                case "mouseup":
+                    MouseController.up(at: MouseController.currentPosition(),
+                                       button: MouseController.HWButton(rawValue: step.button ?? 0) ?? .left)
+                case "moveby":
+                    MouseController.moveBy(dx: step.dx ?? 0, dy: step.dy ?? 0)
+                    usleep(20_000)
+                case "dragby":
+                    var p = MouseController.currentPosition()
                     MouseController.down(at: p)
-                    usleep(40_000)
-                    MouseController.up(at: p)
+                    usleep(25_000)
+                    let screen = MouseController.screenSize
+                    let ddx = CGFloat(step.dx ?? 0) / 6
+                    let ddy = CGFloat(step.dy ?? 0) / 6
+                    for _ in 0..<6 {
+                        p = MouseController.currentPosition()
+                        p.x = min(max(p.x + ddx, 0), screen.width - 1)
+                        p.y = min(max(p.y + ddy, 0), screen.height - 1)
+                        MouseController.drag(to: p)
+                        usleep(12_000)
+                    }
+                    MouseController.up(at: MouseController.currentPosition(), pressed: true)
+                case "scroll":
+                    for _ in 0..<max(1, abs(step.dy ?? 1)) {
+                        MouseController.scroll(dy: (step.dy ?? 0) > 0 ? 1 : -1)
+                        usleep(30_000)
+                    }
+                case "savepos":
+                    savedColorPoint = MouseController.currentPosition()
+                case "restorepos":
+                    if let p = savedColorPoint {
+                        MouseController.move(to: p)
+                        usleep(20_000)
+                    } else {
+                        err = "nothing saved — add a save-position step first"
+                    }
+                case "sens":
+                    sensFactor = step.sensPercent
+                case "cycletarget":
+                    let list = step.cycleList.isEmpty ? colorConfig.targets.keys.filter { TargetCatalog.entry(for: $0) != nil || true }.sorted() : step.cycleList
+                    guard let name = list.first, let t = colorConfig.targets[name] else {
+                        err = "no calibrated targets to cycle"
+                        break
+                    }
+                    MouseController.move(to: t.point)
+                    usleep(20_000)
+                    last = t.point
+                case "releaseall":
+                    disarmColor()
                 case "hold":
                     let p = last ?? MouseController.currentPosition()
                     MouseController.down(at: p)
@@ -436,6 +650,29 @@ public final class SpeedColorsDaemon {
                         CGKeyCode(truncatingIfNeeded: codeInt),
                         flags: CGEventFlags(rawValue: UInt64(step.flags ?? 0)),
                         toPid: resolvePid())
+                    usleep(40_000)
+                case "keydown", "keyup":
+                    guard let codeInt = step.keyCode else {
+                        err = "key not captured"
+                        break
+                    }
+                    if step.type == "keydown" {
+                        EventInjector.chordDown(
+                            CGKeyCode(truncatingIfNeeded: codeInt),
+                            flags: CGEventFlags(rawValue: UInt64(step.flags ?? 0)),
+                            toPid: resolvePid())
+                        usleep(60_000)
+                        // Test runs must never leave a key held.
+                        EventInjector.chordUp(
+                            CGKeyCode(truncatingIfNeeded: codeInt),
+                            flags: CGEventFlags(rawValue: UInt64(step.flags ?? 0)),
+                            toPid: resolvePid())
+                    } else {
+                        EventInjector.chordUp(
+                            CGKeyCode(truncatingIfNeeded: codeInt),
+                            flags: CGEventFlags(rawValue: UInt64(step.flags ?? 0)),
+                            toPid: resolvePid())
+                    }
                     usleep(40_000)
                 case "wait":
                     usleep(UInt32(min(max(step.ms ?? 0, 0), 2_000)) * 1_000)
