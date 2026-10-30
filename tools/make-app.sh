@@ -1,5 +1,5 @@
 #!/bin/sh
-# make-app.sh — build SpeedColorsUI and package it as dist/SpeedColors.app.
+# make-app.sh — build SpeedColors and package it as dist/SpeedColors.app.
 #
 # The bundle is what makes it a first-class macOS menu bar app: LSUIElement
 # keeps it off the Dock (the SwiftUI MenuBarExtra supplies the status item),
@@ -13,7 +13,7 @@ cd "$(dirname "$0")/.."
 
 ./dev.sh build
 
-EXE=.build/out/Products/Debug/SpeedColorsUI
+EXE=.build/debug/SpeedColors
 APP=dist/SpeedColors.app
 [ -x "$EXE" ] || { echo "✗ $EXE missing — build failed?" >&2; exit 1; }
 

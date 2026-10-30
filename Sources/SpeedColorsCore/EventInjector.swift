@@ -98,8 +98,7 @@ public enum EventInjector {
     public static let accessibilityInstructions = """
     ⚠️  Accessibility permission required.
         System Settings → Privacy & Security → Accessibility
-        → add & enable the app that runs speedcolors (your terminal, or the
-          speedcolors binary itself).
+        → add & enable the app that runs SpeedColors (the bundle or the raw binary).
         Then restart the daemon.
     """
 }

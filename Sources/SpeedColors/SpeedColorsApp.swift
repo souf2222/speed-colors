@@ -1,4 +1,4 @@
-// SpeedColorsUIApp.swift — app entry + DaemonController.
+// SpeedColorsApp.swift — app entry + DaemonController.
 //
 // The controller is the single source of truth for UI state: daemon lifecycle,
 // live hardware state, the configuration (via read-modify-write against the
@@ -10,7 +10,7 @@ import SwiftUI
 import SpeedColorsCore
 
 @main
-struct SpeedColorsUIApp: App {
+struct SpeedColorsApp: App {
     @StateObject private var controller = DaemonController()
 
     init() {

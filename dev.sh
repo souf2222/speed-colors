@@ -7,7 +7,7 @@
 # SDK still uses plain property wrappers, so we fall back to it until the
 # plugin shows up (future CLT update, or full Xcode install).
 #
-# Usage:  ./dev.sh build | ./dev.sh run SpeedColorsUI | ./dev.sh run -q speedcolors status
+# Usage:  ./dev.sh build | ./dev.sh run SpeedColors
 set -e
 CLT=/Library/Developer/CommandLineTools
 if [ -f "$CLT/usr/lib/swift/host/plugins/libSwiftUIMacros.dylib" ]; then

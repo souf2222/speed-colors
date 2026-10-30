@@ -1,43 +1,66 @@
-# speedcolors
+# SpeedColors
 
-A companion tool for the **DaVinci Resolve Speed Editor** keyboard on macOS:
-it takes ownership of the panel over USB/Bluetooth, shows which Resolve page is
-active, and gives you a fully configurable button map on the Color page — while
-leaving stock behavior untouched on everything else.
+A companion app for the **DaVinci Resolve Speed Editor** keyboard on macOS.
+SpeedColors takes ownership of the panel over USB or Bluetooth, detects which
+Resolve page is active in real time, and gives you a fully configurable button
+map on the Color page — while leaving Resolve's stock behavior untouched on
+every other page.
+
+**Highlights**
+
+- Keep the Speed Editor's native Cut/Edit workflow and add your own macros on
+  the Color page (or any custom binding you like)
+- Bind buttons to calibrated screen targets, mouse clicks, keyboard shortcuts,
+  or multi-step sequences
+- Multiple profiles with per-profile bindings, dial sensitivity, and names
+- Live hardware view: battery, jog/dial state, key capture, hardware layout
+- Bluetooth and USB transports
 
 ## How it works
 
 The Speed Editor is a strictly single-client HID device (VID `0x1EDB`, PID
 `0xDA0E`): whoever holds it gets the buttons, and it authenticates with a
-proprietary challenge/response handshake. speedcolors exploits a nice property
+proprietary challenge/response handshake. SpeedColors exploits a nice property
 of that design — the moment the daemon quits, Resolve reclaims the device on
 its own and stock behavior resumes. No Resolve restart, no mode toggling.
 
-- **Cut / Edit / Media / Fairlight / Deliver pages** → the daemon mirrors
-  Resolve's native Speed Editor mapping by injecting the corresponding keyboard
+The daemon installed by the app does the page-dependent work:
+
+- **Cut / Edit / Media / Fairlight / Deliver pages** — it mirrors Resolve's
+  native Speed Editor mapping by injecting the corresponding keyboard
   shortcuts into Resolve (PID-targeted: it only needs to be *running*, not
   frontmost).
-- **Color page** (detected live via Resolve's scripting bridge) → each button
-  runs a configured **macro sequence**. Steps can:
-  - `goto` — park the cursor on a calibrated screen target (e.g. the Lift wheel)
+- **Color page** — detected live via Resolve's scripting bridge; each button
+  runs a configured **macro sequence** instead. Steps can be:
+  - `goto` — park the cursor on a calibrated screen target (e.g. the Lift
+    wheel), which you pick up with the search dial
+  - `hold` — press the mouse down until the key is released (e.g. spin the
+    dial to drag Lift in Wheel 1)
   - `click` — full mouse click
-  - `hold` — press the mouse down until the key is released, so the search dial
-    drags the control (e.g. spin the dial to pull Lift in Wheel 1)
   - `key` — inject any keyboard shortcut (⌘/⌥/⇧/⌃ + keycode)
   - `wait` — pause for N ms
-
-Configuration lives in `~/.speedcolors/color.json` and is hand-editable; the
-bundled SwiftUI app edits it for you.
 
 ## Requirements
 
 - macOS 13+ (Apple Silicon or Intel)
+- [DaVinci Resolve](https://www.blackmagicdesign.com/products/davinciresolve)
+  installed and running (needed for page detection and injection)
 - [hidapi](https://github.com/libusb/hidapi): `brew install hidapi`
-- [uv](https://docs.astral.sh/uv/): `brew install uv` — used by the tiny Python
-  sidecar that talks to Resolve's scripting bridge (only stdlib is used)
-- **Accessibility permission** for the process running the daemon (System
-  Settings → Privacy & Security → Accessibility) — needed to inject input
-  events. The CLI prints instructions and exits if it's missing.
+- [uv](https://docs.astral.sh/uv/): `brew install uv` — used by the tiny
+  bundled Python sidecar that talks to Resolve's scripting bridge (stdlib
+  only)
+
+## Permissions
+
+The daemon injects keyboard and mouse events, so the process running it needs
+the **Accessibility** permission:
+
+System Settings → Privacy & Security → Accessibility → add & enable
+**SpeedColors** (the app bundle, or the raw binary if you launch it directly).
+
+The app detects a missing grant and points you at the right fix. Grants stick
+across rebuilds when you use the packaged app (stable bundle id), but re-prompt
+if you run the raw build-tree binary directly.
 
 ## Build
 
@@ -47,62 +70,51 @@ bundled SwiftUI app edits it for you.
 
 `dev.sh` is just a `swift` wrapper for machines with Command Line Tools only:
 recent CLT SDKs ship SwiftUI macros without the corresponding compiler plugin,
-so the script pins an older SDK until that's fixed (with full Xcode installed,
-plain `swift build` works too).
+so the script pins an older SDK until that's fixed. With full Xcode installed,
+plain `swift build` works too.
 
-## Usage
+## Run
 
-### Daemon (the main command)
-
-```sh
-./dev.sh run speedcolors run            # start the daemon (Ctrl-C to stop)
-./dev.sh run speedcolors run --jog-step 800
-```
-
-While running: keys are mirrored on Cut/Edit-type pages, and your configured
-macros fire on the Color page. Quitting instantly hands the panel back to
-Resolve.
-
-### Calibration (Color page targets)
+### Development (raw binary)
 
 ```sh
-./dev.sh run speedcolors autocal        # OCR the Resolve window, auto-detect wheels/curves…
-./dev.sh run speedcolors autocal --debug
-./dev.sh run speedcolors coords --list  # show saved targets
-./dev.sh run speedcolors coords --save lift   # record cursor position under a name (3 s countdown)
-./dev.sh run speedcolors coords --remove lift
+./dev.sh run SpeedColors
 ```
 
-Run `autocal` with the Color page open and the primaries palette visible; it
-saves targets to `~/.speedcolors/color.json` plus an annotated screenshot so
-you can verify the detected boxes. Anything it misses can be recorded manually
-with `coords --save <name>`.
+Launches the menu bar app straight from the build tree (it self-registers as
+an accessory app, no Dock icon).
 
-Tune the search-dial feel with `--jog-step` (jog units accumulated per
-arrow-key tap).
-
-### Diagnostics & exploration
-
-| Command | What it does |
-|---|---|
-| `speedcolors status` | find the panel, authenticate, report battery |
-| `speedcolors events [-d SECONDS]` | print live key / dial / battery events |
-| `speedcolors leds-demo` | chase every panel and jog-mode LED to verify the mapping |
-| `speedcolors hold -s 12` | hold the device exclusively for N s (handoff experiment) |
-| `speedcolors list-hid` | enumerate all HID devices via IOKit/hidapi |
-| `speedcolors probe-hid` | try opening every Speed Editor interface |
-| `speedcolors ble-scan` / `ble-dump` | Bluetooth LE discovery / GATT dump |
-| `speedcolors page` | ask the running Resolve which page is active |
-
-### GUI
+### Packaged app
 
 ```sh
-./dev.sh run SpeedColorsUI
+tools/make-app.sh            → dist/SpeedColors.app
+open dist/SpeedColors.app    → launch into the menu bar
 ```
 
-A SwiftUI app that runs the same daemon core: manage binding macros per
-profile, edit and test targets, inspect captured keys, view hardware layout
-and live dial/battery state.
+The .app bundle makes it a first-class macOS app: `LSUIElement` keeps it off
+the Dock (the `MenuBarExtra` supplies the status item), and the stable bundle
+id means Accessibility grants persist across rebuilds.
+
+Once launched, SpeedColors appears in the menu bar — start/stop the daemon
+from there, and everything else (profiles, targets, bindings, diagnostics)
+lives in its panels.
+
+## Configuration
+
+All configuration lives in `~/.speedcolors/color.json` and is hand-editable;
+the app edits it for you and watches for external changes. Key structure:
+
+- `targets` — calibrated screen coordinates per named Color-page target
+- `bindings` → the active profile's macro sequences (per hardware key)
+- `dialSensitivity` / `pixelsPerUnit` — search-dial feel
+- `jogUnitsPerArrow` — jog units accumulated per arrow-key tap
+- `storedProfiles` / `activeProfile` — snapshot-based profile storage
+
+Profiles are snapshot-based: the active profile's data sits in the flat
+fields (so the daemon reads it with zero overhead), everything else is
+snapshotted into `storedProfiles` and swapped out on switching.
+
+Diagnostic logs end up in `~/.speedcolors/ui.log`.
 
 ## Project layout
 
@@ -111,9 +123,10 @@ Sources/
   CHid/            module map + shim for hidapi
   SpeedColorsCore/ HID transport, auth, daemon, macros, OCR autocalibration,
                    Resolve bridge, BLE exploration
-  speedcolors/     CLI (swift-argument-parser)
-  SpeedColorsUI/   SwiftUI settings/control app
+  SpeedColors/     SwiftUI menu bar app (daemon control, profiles, targets,
+                   bindings, diagnostics)
 tools/
+  make-app.sh             package the debug build as dist/SpeedColors.app
   resolve_page_agent.py   Python sidecar for Resolve's scripting bridge
   pdfsearch.swift         helper used during reverse engineering
 ```
@@ -121,6 +134,7 @@ tools/
 ## Status
 
 Reverse-engineered against real hardware: the auth handshake, LED control,
-jog modes, and the page-watcher bridge are working; treat the protocol details
-as unofficial, and expect Bluetooth transport to be rougher than USB.
-Requires Resolve to be installed and running for page detection and injection.
+jog modes, and the page-watcher bridge are working. Treat the protocol details
+as unofficial — this project is not affiliated with Blackmagic Design, and a
+DaVinci update could shift the ground under it. Bluetooth transport is rougher
+than USB at this point.

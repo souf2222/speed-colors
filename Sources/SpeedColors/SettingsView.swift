@@ -105,7 +105,7 @@ struct SettingsView: View {
                     .frame(width: 8, height: 8)
                 Text(controller.accessibilityOK
                      ? "Accessibility granted — key and mouse injection work."
-                     : "Accessibility required — enable SpeedColorsUI in System Settings.")
+                     : "Accessibility required — enable SpeedColors in System Settings.")
                     .font(.system(size: 12))
                     .foregroundColor(controller.accessibilityOK ? Graphite.text2 : Graphite.text)
                 Spacer()

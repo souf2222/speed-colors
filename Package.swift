@@ -2,11 +2,8 @@
 import PackageDescription
 
 let package = Package(
-    name: "speedcolors",
+    name: "SpeedColors",
     platforms: [.macOS(.v13)],
-    dependencies: [
-        .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.5.0"),
-    ],
     targets: [
         .systemLibrary(
             name: "CHid",
@@ -18,14 +15,7 @@ let package = Package(
             dependencies: ["CHid"]
         ),
         .executableTarget(
-            name: "speedcolors",
-            dependencies: [
-                "SpeedColorsCore",
-                .product(name: "ArgumentParser", package: "swift-argument-parser"),
-            ]
-        ),
-        .executableTarget(
-            name: "SpeedColorsUI",
+            name: "SpeedColors",
             dependencies: ["SpeedColorsCore"]
         ),
     ]
