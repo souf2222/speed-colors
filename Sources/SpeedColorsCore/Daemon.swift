@@ -764,8 +764,17 @@ public final class SpeedColorsDaemon {
             jogBudget += (right ? -1 : 1) * config.jogUnitsPerArrow
             taps += 1
         }
+        // Capped (12 taps ≈ the most we can inject in one report window): drop
+        // the remainder. Otherwise a backlog accumulates — with SCRL ×8 one
+        // report is worth ~20 arrows — and stale budget later fires arrows in
+        // the OLD direction after the user reverses (observed as inverted
+        // direction flips in the activity log).
+        if taps == 12 && jogBudget != 0 {
+            jogBudget = 0
+        }
         if taps > 0 {
-            log("🎡 DIAL  Δ\(delta)  sens ×\(sens)  →  \(taps) arrow\(taps > 1 ? "s" : "") \(direction)  [\(mode)]")
+            let capped = taps == 12 ? "  (capped, backlog dropped)" : ""
+            log("🎡 DIAL  Δ\(delta)  sens ×\(sens)  →  \(taps) arrow\(taps > 1 ? "s" : "") \(direction)  [\(mode)]\(capped)")
         }
     }
 }
