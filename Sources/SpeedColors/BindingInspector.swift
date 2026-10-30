@@ -291,22 +291,56 @@ struct KeyInspector: View {
                             } label: {
                                 Label("Add release action", systemImage: "plus")
                                     .font(.system(size: 11, weight: .medium))
-                                    .foregroundColor(Graphite.text2)
+                                    .foregroundColor(releasedDropActive ? HWColor.selection : Graphite.text2)
                             }
                             .menuStyle(.borderlessButton)
                             .fixedSize()
+                            if releasedDropActive {
+                                Label("drop to append at end", systemImage: "arrow.down.circle")
+                                    .font(.system(size: 10))
+                                    .foregroundColor(HWColor.selection)
+                            }
                             Spacer()
                         }
                         .padding(.vertical, 2)
+                        .contentShape(Rectangle())
+                        .onDrop(of: [UTType.plainText], isTargeted: $releasedDropActive) { providers in
+                            // Dropping below the last row appends at the end.
+                            let defaultTarget = controller.config.targets.keys.sorted().first
+                            return ActionDrop.step(from: providers.first ?? NSItemProvider(),
+                                                   defaultTarget: defaultTarget) { new in
+                                guard let new else { return }
+                                appendReleasedAction(new)
+                            }
+                        }
                     } else {
+                        // Collapsed section: still a drop target — dropping an
+                        // action here expands the section and appends the
+                        // first release step.
                         Button {
                             showReleased = true
                         } label: {
-                            Label("When released", systemImage: "chevron.down")
+                            Label("When released", systemImage: releasedDropActive ? "plus.circle" : "chevron.down")
                                 .font(.system(size: 11, weight: .medium))
-                                .foregroundColor(Graphite.text2)
+                                .foregroundColor(releasedDropActive ? HWColor.selection : Graphite.text2)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 4)
+                                .background(RoundedRectangle(cornerRadius: 4).fill(
+                                    releasedDropActive ? HWColor.selection.opacity(0.15) : Color.clear))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 4)
+                                        .stroke(releasedDropActive ? HWColor.selection : Color.clear, lineWidth: 1.5))
                         }
                         .buttonStyle(.plain)
+                        .onDrop(of: [UTType.plainText], isTargeted: $releasedDropActive) { providers in
+                            let defaultTarget = controller.config.targets.keys.sorted().first
+                            return ActionDrop.step(from: providers.first ?? NSItemProvider(),
+                                                   defaultTarget: defaultTarget) { new in
+                                guard let new else { return }
+                                appendReleasedAction(new)
+                            }
+                        }
+                        .help("Drag an action here to run it when the key is released")
                     }
                 } header: {
                     Text("WHEN RELEASED")
