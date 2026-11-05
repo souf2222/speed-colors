@@ -80,6 +80,14 @@ struct DiagnosticsView: View {
             stateRow(color: controller.accessibilityOK ? Graphite.green : Graphite.red,
                      title: "Permissions",
                      value: controller.accessibilityOK ? "Accessibility granted" : "Accessibility required — key injection will fail")
+            stateRow(color: controller.screenRecordingOK ? Graphite.green : Graphite.amber,
+                     title: "Screen Rec.",
+                     value: controller.screenRecordingOK ? "Granted — palette auto-detect works"
+                         : "Missing — palette auto-detect disabled")
+            stateRow(color: controller.inputMonitoringOK ? Graphite.green : Graphite.amber,
+                     title: "Input Monit.",
+                     value: controller.inputMonitoringOK ? "Granted — shortcut recorder swallows keys"
+                         : "Missing — key capture falls back (keys may leak)")
             if let batt = controller.batteryLine {
                 stateRow(color: Graphite.text2, title: "Battery", value: batt)
             }

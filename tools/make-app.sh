@@ -20,6 +20,9 @@ APP=dist/SpeedColors.app
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$EXE" "$APP/Contents/MacOS/SpeedColors"
+# The page-watcher sidecar ships inside the bundle — a bundled app launched
+# via `open` has CWD "/" and could never find the repo-relative tools/ copy.
+cp tools/resolve_page_agent.py "$APP/Contents/Resources/"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -40,8 +43,34 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-# Let the packaged app resolve dylibs/libraries from its own location too.
-codesign --force --sign - "$APP" >/dev/null 2>&1 || true
+# Signing matters for privacy grants: macOS keys TCC permissions (Accessibility,
+# Screen Recording, Input Monitoring) on the app's signing identity. An ad-hoc
+# signature (—) changes cdhash on every rebuild, so each rebuild can re-prompt.
+# If a stable local code-signing certificate exists (create one in Keychain
+# Access: Certificate Assistant → Create a Certificate → name it e.g.
+# "SpeedColors Dev", type Code Signing), sign with it so grants stick across
+# rebuilds. Fall back to ad-hoc otherwise.
+SIGN_ID="${SPEEDCOLORS_SIGN_ID:-}"
+if [ -z "$SIGN_ID" ]; then
+    # Only genuinely VALID identities (no CSSMERR failures), preferring the
+    # project's own stable certificate over unrelated ones.
+    valid_ids=$(security find-identity -v -p codesigning 2>/dev/null \
+        | sed -nE 's/^[[:space:]]*[0-9]+\)[[:space:]]*[0-9A-Fa-f]+[[:space:]]+"(.*)".*/\1/p')
+    SIGN_ID=$(printf '%s\n' "$valid_ids" | grep -m1 '^SpeedColors Dev$' || true)
+    [ -n "$SIGN_ID" ] || SIGN_ID=$(printf '%s\n' "$valid_ids" | head -1)
+fi
+if [ -n "$SIGN_ID" ]; then
+    if codesign --force --sign "$SIGN_ID" "$APP" >/dev/null 2>&1; then
+        echo "  signed with: $SIGN_ID (privacy grants persist across rebuilds)"
+    else
+        codesign --force --sign - "$APP" >/dev/null 2>&1 || true
+        echo "  signed ad-hoc (certificate '$SIGN_ID' unusable)"
+    fi
+else
+    codesign --force --sign - "$APP" >/dev/null 2>&1 || true
+    echo "  signed ad-hoc — macOS may re-ask permissions after rebuilds"
+    echo "  (create a 'SpeedColors Dev' code-signing certificate to fix permanently)"
+fi
 
 echo "✓ $APP"
 echo "  → open it with:  open $APP"

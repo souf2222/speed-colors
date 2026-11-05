@@ -11,8 +11,36 @@ struct TargetsView: View {
 
     var body: some View {
         HStack(spacing: 0) {
-            TargetList(controller: controller)
-                .frame(width: 320)
+            VStack(spacing: 0) {
+                // Workspace layout selector: calibrations are saved per layout
+                // ("split" coords live beside, never overwriting, the singles).
+                HStack(spacing: 6) {
+                    Text("Calibrate layout:")
+                        .font(.system(size: 10.5))
+                        .foregroundColor(Graphite.text3)
+                    Menu {
+                        Button("Auto (detect from palette)") { controller.setWorkspaceLayout(nil) }
+                        Button("Single palette") { controller.setWorkspaceLayout("single") }
+                        Button("Split palettes") { controller.setWorkspaceLayout("split") }
+                    } label: {
+                        HStack(spacing: 4) {
+                            Text(controller.config.workspaceLayout ?? "auto")
+                            Image(systemName: "chevron.up.chevron.down")
+                                .font(.system(size: 7, weight: .semibold))
+                        }
+                        .font(.system(size: 10.5, weight: .semibold))
+                        .foregroundColor(HWColor.selection)
+                    }
+                    .controlSize(.small)
+                    .fixedSize()
+                    Spacer()
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(Graphite.bg.opacity(0.6))
+                TargetList(controller: controller)
+                    .frame(width: 320)
+            }
             Divider().overlay(Graphite.border)
             TargetInspectorPane(controller: controller)
                 .frame(maxWidth: .infinity)

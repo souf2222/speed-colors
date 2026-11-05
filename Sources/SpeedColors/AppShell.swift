@@ -198,6 +198,8 @@ struct AppShell: View {
 
             if !controller.accessibilityOK {
                 Pill(color: Graphite.red, label: "⚠︎ Accessibility required")
+            } else if !controller.screenRecordingOK {
+                Pill(color: Graphite.amber, label: "⚠︎ Screen Recording off — no palette auto-detect")
             }
 
             if controller.deviceConnected != true || !controller.accessibilityOK {

@@ -28,8 +28,31 @@ public struct ResolvePageInfo: CustomStringConvertible {
 }
 
 public enum ResolveAgent {
-    /// Where the sidecar script lives when running from the repo root.
-    public static let defaultScriptPath = "tools/resolve_page_agent.py"
+    /// Where the sidecar script lives — resolved ONCE to an absolute path:
+    ///   1. the packaged app's Resources (the bundle is self-contained),
+    ///   2. tools/ under the current working directory (`swift run` from the
+    ///      repo root),
+    ///   3. tools/ next to the bundle (dist/SpeedColors.app → repo root),
+    ///   4. the bare relative path as the historical fallback.
+    /// A relative path breaks when the app is launched via `open` (CWD "/"),
+    /// which used to leave the page watcher restart-looping forever, silent,
+    /// reporting nothing.
+    public static let defaultScriptPath: String = {
+        let name = "resolve_page_agent.py"
+        let fm = FileManager.default
+        if let resources = Bundle.main.resourceURL {
+            let p = resources.appendingPathComponent(name).path
+            if fm.fileExists(atPath: p) { return p }
+        }
+        let relative = "tools/\(name)"
+        if fm.fileExists(atPath: relative) { return relative }
+        let fromBundle = Bundle.main.bundleURL
+            .deletingLastPathComponent()   // dist/
+            .deletingLastPathComponent()   // repo root
+            .appendingPathComponent(relative).path
+        if fm.fileExists(atPath: fromBundle) { return fromBundle }
+        return relative
+    }()
 
     /// Query the running Resolve once. Returns nil if Resolve isn't running.
     public static func queryPage(script: String = defaultScriptPath) throws -> ResolvePageInfo? {

@@ -158,13 +158,40 @@ public enum SpeedEditorKey: UInt16, CaseIterable, Sendable, CustomStringConverti
         }
     }
 
+    /// The panel LED that physically sits under this key, if any. Only 18
+    /// keys have backlights (camera column, cut row, transport-ish keys);
+    /// keys like TRIM IN or ROLL have none and return nil.
+    public var led: SpeedEditorLed? {
+        switch self {
+        case .closeUp:   return .closeUp
+        case .cut:       return .cut
+        case .dis:       return .dis
+        case .smthCut:   return .smthCut
+        case .trans:     return .trans
+        case .snap:      return .snap
+        case .cam1:      return .cam1
+        case .cam2:      return .cam2
+        case .cam3:      return .cam3
+        case .cam4:      return .cam4
+        case .cam5:      return .cam5
+        case .cam6:      return .cam6
+        case .cam7:      return .cam7
+        case .cam8:      return .cam8
+        case .cam9:      return .cam9
+        case .liveOwr:   return .liveOwr
+        case .videoOnly: return .videoOnly
+        case .audioOnly: return .audioOnly
+        default:         return nil
+        }
+    }
+
     public var description: String { label }
 }
 
 // MARK: - LEDs
 
 /// Panel LEDs — output report 0x02, u32 LE bitmask.
-public struct SpeedEditorLed: OptionSet, Sendable, CustomStringConvertible {
+public struct SpeedEditorLed: OptionSet, Sendable, CustomStringConvertible, Hashable {
     public let rawValue: UInt32
     public init(rawValue: UInt32) { self.rawValue = rawValue }
 

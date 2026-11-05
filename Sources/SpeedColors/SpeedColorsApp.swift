@@ -6,6 +6,7 @@
 // test runner wiring.
 
 import AppKit
+import Combine
 import SwiftUI
 import SpeedColorsCore
 
@@ -68,6 +69,52 @@ struct MenuBarPanel: View {
                  label: controller.page.map { p in p == "color" ? "COLOR PAGE" : "page: \(p)" }
                         ?? "Resolve not detected")
 
+            // Active palette(s) right beside the page pill — open palettes
+            // are listed; a closed palette simply disappears from here.
+            if controller.page == "color" {
+                if let pill = controller.palettePill {
+                    Pill(color: pill.contains("verified") ? Graphite.cyan : Graphite.amber,
+                         label: pill)
+                        .help("Palettes SpeedColors believes are open, with how much it trusts that (verified = seen on screen · assumed = SpeedColors just clicked)")
+                } else {
+                    Pill(color: Graphite.text3, label: "palette ?")
+                        .help("No palette tracked — press a key with a “Set palette state” step, or use “Ensure palette”")
+                }
+            }
+
+            if let ps = controller.paletteStatus {
+                Text(ps)
+                    .font(.system(size: 10).monospaced())
+                    .foregroundColor(Graphite.text2)
+                    .lineLimit(1)
+                    .help("Tracked palette slots and how much SpeedColors trusts them")
+            }
+
+            // Missing privacy grants — asked at launch, re-askable here.
+            if !controller.missingPermissions.isEmpty {
+                Divider().overlay(Graphite.border)
+                VStack(alignment: .leading, spacing: 7) {
+                    ForEach(controller.missingPermissions) { kind in
+                        HStack(spacing: 8) {
+                            Circle()
+                                .fill(Graphite.amber)
+                                .frame(width: 8, height: 8)
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(kind.title)
+                                    .font(.system(size: 12, weight: .medium))
+                                    .foregroundColor(Graphite.text)
+                                Text(kind.why)
+                                    .font(.system(size: 10))
+                                    .foregroundColor(Graphite.text3)
+                            }
+                            Spacer()
+                            Button("Grant…") { controller.grantPermission(kind) }
+                                .buttonStyle(MiniButtonStyle(accent: Graphite.blue))
+                        }
+                    }
+                }
+            }
+
             Divider().overlay(Graphite.border)
 
             HStack(spacing: 8) {
@@ -93,6 +140,13 @@ struct MenuBarPanel: View {
         .frame(width: 300)
         .background(Graphite.bg)
         .preferredColorScheme(.dark)
+        .onAppear { controller.refreshPermissions() }
+        .onReceive(Timer.publish(every: 3, on: .main, in: .common).autoconnect()) { _ in
+            // Live status while the panel is open — grants flip in System
+            // Settings, not here. Input Monitoring is probed on explicit
+            // actions only.
+            controller.refreshPermissions()
+        }
     }
 }
 
@@ -163,9 +217,50 @@ final class DaemonController: ObservableObject {
     @Published var logLines: [String] = []
     @Published var isRunning = false
     @Published var accessibilityOK = EventInjector.isAccessibilityGranted()
+    @Published var screenRecordingOK = AppPermissions.screenRecordingGranted
+    /// Probe result for the event tap the shortcut recorder needs. Probed at
+    /// launch and on explicit re-check only — creating event taps repeatedly
+    /// is not something to do on a timer.
+    @Published var inputMonitoringOK = AppPermissions.inputMonitoringGranted
     @Published var config: ColorModeConfig
     @Published var autocalBusy = false
     @Published var batteryLine: String?
+    /// "Split · L: HDR · R: Key · assumed" — the workspace/palette status line.
+    @Published var paletteStatus: String?
+    /// Compact pill next to the page pill: "HDR + Key · verified" / nil.
+    @Published var palettePill: String?
+
+    // MARK: LED indicators (Settings)
+
+    func addIndicator() {
+        freshConfigThen { c in
+            c.ledIndicators.append(ColorModeConfig.LEDIndicator(
+                key: "cam1",
+                expr: .group(.all, [.cond(MacroCond(kind: .palette, value: "HDR"))])))
+        }
+        appendLog("· LED indicator added")
+    }
+
+    func removeIndicator(_ id: String) {
+        freshConfigThen { c in
+            c.ledIndicators.removeAll { $0.id == id }
+        }
+        appendLog("· LED indicator removed")
+    }
+
+    func setIndicatorKey(_ keyId: String, index: Int) {
+        freshConfigThen { c in
+            guard c.ledIndicators.indices.contains(index) else { return }
+            c.ledIndicators[index].key = keyId
+        }
+    }
+
+    func setIndicatorExpr(_ expr: MacroExpr, index: Int) {
+        freshConfigThen { c in
+            guard c.ledIndicators.indices.contains(index) else { return }
+            c.ledIndicators[index].expr = expr
+        }
+    }
 
     // UI navigation & selection
     @Published var section: AppSection = .controls
@@ -196,6 +291,8 @@ final class DaemonController: ObservableObject {
     // Test runner state
     @Published var testStepIndex: Int?
     @Published var testErrors: [Int: String] = [:]
+    /// Leaf-node ids of the currently tested sequence (testStepIndex indexes it).
+    @Published var testLeafIds: [String] = []
 
     // Search-dial runtime state ("JOG · dragging Wheel 1 · Lift — color")
     @Published var dialState = "JOG · idle"
@@ -208,6 +305,11 @@ final class DaemonController: ObservableObject {
 
     init() {
         config = ColorModeConfig.load()
+        // Ask for every missing privacy grant shortly after launch — the
+        // system dialogs need the app to be fully up before they appear.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) { [weak self] in
+            self?.promptMissingPermissions()
+        }
         // Debug/DI only: `SC_OPEN_WINDOW=1` opens the editor window at launch
         // so the in-app behavior can be driven/exercised headlessly.
         if ProcessInfo.processInfo.environment["SC_OPEN_WINDOW"] == "1" {
@@ -218,11 +320,76 @@ final class DaemonController: ObservableObject {
         }
     }
 
+    // MARK: Permissions
+
+    var missingPermissions: [AppPermissions.Kind] {
+        var out: [AppPermissions.Kind] = []
+        if !accessibilityOK { out.append(.accessibility) }
+        if !screenRecordingOK { out.append(.screenRecording) }
+        if !inputMonitoringOK { out.append(.inputMonitoring) }
+        return out
+    }
+
+    /// Accessibility and Screen Recording preflight cheaply and safely; the
+    /// Input Monitoring probe creates an event tap, so it only re-runs on
+    /// explicit request.
+    func refreshPermissions(reprobeInputMonitoring: Bool = false) {
+        accessibilityOK = EventInjector.isAccessibilityGranted()
+        screenRecordingOK = AppPermissions.screenRecordingGranted
+        if reprobeInputMonitoring {
+            inputMonitoringOK = AppPermissions.inputMonitoringGranted
+        }
+    }
+
+    /// Asks for every missing grant once per launch, staggered so the system
+    /// dialogs don't land on top of each other. Grant buttons in the UI reuse
+    /// the same prompts.
+    func promptMissingPermissions() {
+        refreshPermissions()
+        let missing = missingPermissions
+        guard !missing.isEmpty else { return }
+        appendLog("· permissions needed: \(missing.map(\.title).joined(separator: ", "))")
+        for (i, kind) in missing.enumerated() {
+            DispatchQueue.main.asyncAfter(deadline: .now() + Double(i) * 1.2) { [weak self] in
+                kind.prompt()
+                self?.appendLog("· asked for \(kind.title) — \(kind.why)")
+            }
+        }
+    }
+
+    func grantPermission(_ kind: AppPermissions.Kind) {
+        kind.prompt()
+        appendLog("· asked for \(kind.title) — \(kind.why)")
+        // Status only flips after the user toggles the switch in System
+        // Settings; re-check shortly after, with a real probe for Input
+        // Monitoring.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
+            self?.refreshPermissions(reprobeInputMonitoring: kind == .inputMonitoring)
+        }
+    }
+
+    /// Fixes the "Grant does nothing" case: a stale TCC entry (left over from
+    /// an earlier build) makes macOS skip the prompt entirely. Clear the
+    /// entry, then ask again — the fresh dialog now actually appears.
+    func resetAndReAskPermission(_ kind: AppPermissions.Kind) {
+        let ok = AppPermissions.resetEntry(kind)
+        appendLog(ok ? "· reset stale \(kind.title) entry — asking again"
+                     : "✗ could not reset \(kind.title) (no bundle id?) — toggle it off/on in System Settings instead")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            self?.grantPermission(kind)
+        }
+    }
+
     // MARK: Daemon lifecycle
 
     func startDaemon() {
         guard daemon == nil else { return }
-        accessibilityOK = EventInjector.isAccessibilityGranted()
+        refreshPermissions(reprobeInputMonitoring: true)
+        if !accessibilityOK {
+            appendLog("⚠️ Accessibility missing — key & mouse injection will be silent no-ops (use Grant… in the menu panel)")
+        } else if !screenRecordingOK {
+            appendLog("⚠️ Screen Recording missing — palette auto-detect disabled")
+        }
         let d = SpeedColorsDaemon(
             config: DaemonConfig(jogUnitsPerArrow: config.jogUnitsPerArrow ?? 800))
         d.onLog = { [weak self] line in
@@ -246,6 +413,12 @@ final class DaemonController: ObservableObject {
             DispatchQueue.main.async {
                 self?.batteryLine = "\(level)%\(charging ? " (charging)" : "")"
             }
+        }
+        d.onPaletteStatus = { [weak self] line in
+            DispatchQueue.main.async { self?.paletteStatus = line }
+        }
+        d.onPalettePill = { [weak self] line in
+            DispatchQueue.main.async { self?.palettePill = line }
         }
         d.start()
         daemon = d
@@ -429,6 +602,60 @@ final class DaemonController: ObservableObject {
         appendLog("· cleared \(ColorModeConfig.label(forKeyId: keyId)) binding")
     }
 
+    /// Swap everything that makes a binding between two keys: pressed and
+    /// released sequences, name, enabled flag, and the face-legend preference.
+    /// Dragging a key onto an unbound key MOVES the binding (the target's
+    /// empty binding lands on the source). ⌘Z restores it in four steps,
+    /// matching the paste pattern (pressed/released per key).
+    func swapBindings(fromKeyId from: String, toKeyId to: String) {
+        pushUndo(keyId: from, phase: .pressed)
+        pushUndo(keyId: from, phase: .released)
+        pushUndo(keyId: to, phase: .pressed)
+        pushUndo(keyId: to, phase: .released)
+        freshConfigThen { c in
+            let aPressed = c.bindings[from] ?? []
+            let aReleased = c.released[from] ?? []
+            let aName = c.bindingNames[from]
+            let aLabel = c.labelFromBinding[from]
+            let aFace = c.keyLabels[from]
+            let aDisabled = c.disabledBindings.contains(from)
+
+            c.bindings[from] = c.bindings[to] ?? []
+            c.released[from] = c.released[to] ?? []
+            c.bindingNames[from] = c.bindingNames[to]
+
+            c.bindings[to] = aPressed
+            c.released[to] = aReleased
+            c.bindingNames[to] = aName
+
+            let bDisabled = c.disabledBindings.contains(to)
+            c.disabledBindings.removeAll { $0 == from || $0 == to }
+            if aDisabled { c.disabledBindings.append(to) }
+            if bDisabled { c.disabledBindings.append(from) }
+
+            let bLabel = c.labelFromBinding[to]
+            c.labelFromBinding[from] = bLabel
+            c.labelFromBinding[to] = aLabel
+
+            // Custom face labels ("PRM", "HDR"…) travel WITH the binding —
+            // this is what makes the move visible on the device replica.
+            let bFace = c.keyLabels[to]
+            c.keyLabels[from] = bFace
+            c.keyLabels[to] = aFace
+
+            let fa = ColorModeConfig.label(forKeyId: from)
+            let ta = ColorModeConfig.label(forKeyId: to)
+            let bPressed = c.bindings[to] ?? []
+            let bReleased = c.released[to] ?? []
+            if aPressed.isEmpty && aReleased.isEmpty {
+                appendLog("· moved binding: \(ta) → \(fa)  (\(bPressed.count) step\(bPressed.count == 1 ? "" : "s"))")
+            } else {
+                appendLog("· swapped bindings: \(fa) ↔ \(ta)  (\(aPressed.count)/\(aReleased.count) ↔ \(bPressed.count)/\(bReleased.count) steps)")
+            }
+        }
+        selectedControl = nil
+    }
+
     /// Drag from the action library onto a hardware control: creates the
     /// binding if none, else appends the step.
     func appendDroppedAction(toKeyId keyId: String, _ step: MacroStep) {
@@ -437,6 +664,221 @@ final class DaemonController: ObservableObject {
         setBinding(keyId, phase: .pressed, steps)
         appendLog("· added \(ActionCatalog.label(for: step)) → \(ColorModeConfig.label(forKeyId: keyId)) (drag)")
         selectedControl = .key(SpeedEditorKey.allCases.first { $0.id == keyId } ?? .none)
+    }
+
+    // MARK: Tree node operations (nested automation editor)
+
+    /// Which phase currently contains the node with this id.
+    private func phaseOfNode(id: String, keyId: String) -> BindingPhase? {
+        if (config.bindings[keyId] ?? []).contains(where: { $0.contains(id: id) || $0.id == id }) { return .pressed }
+        if (config.released[keyId] ?? []).contains(where: { $0.contains(id: id) || $0.id == id }) { return .released }
+        return nil
+    }
+
+    private func rootList(_ keyId: String, _ phase: BindingPhase) -> [MacroStep] {
+        switch phase {
+        case .pressed: return config.bindings[keyId] ?? []
+        case .released: return config.released[keyId] ?? []
+        }
+    }
+
+    private func writeBindingTree(_ keyId: String, _ phase: BindingPhase, _ steps: [MacroStep], _ logLine: String) {
+        appendLog(logLine)
+        pushUndo(keyId: keyId, phase: phase)
+        freshConfigThen { c in
+            switch phase {
+            case .pressed: c.bindings[keyId] = steps
+            case .released: c.released[keyId] = steps
+            }
+        }
+    }
+
+    /// Insert a node (from the library, or a dragged node) at a tree address.
+    /// parentID "" = the phase's root list.
+    func insertNode(_ node: MacroStep, keyId: String, phase: BindingPhase,
+                    parentID: String, slot: String, index: Int) {
+        // Context warnings — prevent easy mistakes.
+        if node.type == "hold" && phase == .released {
+            appendLog("⚠ Hold to adjust in 'When released' runs as a 300 ms click (no dial adjust on release)")
+        }
+        var list = rootList(keyId, phase)
+        if parentID.isEmpty {
+            list = MacroStep.arrayInsert(node, at: index, in: list)
+        } else {
+            guard MacroStep.insert(node, parentID: parentID, slot: slot, index: index, into: &list) else {
+                appendLog("✗ insert failed — destination vanished")
+                return
+            }
+        }
+        writeBindingTree(keyId, phase, list, "· added \(node.describe(labels: config.targetLabel)) → \(ColorModeConfig.label(forKeyId: keyId))")
+    }
+
+    /// Move an existing node (drag & drop anywhere in the tree, including
+    /// across the pressed ⇄ released sections). Destination parent "" = root.
+    func moveNode(id: String, keyId: String,
+                  toParentID: String, toSlot: String, toIndex: Int) {
+        guard let fromPhase = phaseOfNode(id: id, keyId: keyId) else { return }
+        let source = rootList(keyId, fromPhase)
+        let r = MacroStep.removing(id: id, from: source)
+        guard let node = r.removed else { return }
+        // Structural guard: never drop a container into its own subtree.
+        if !toParentID.isEmpty, node.contains(id: toParentID) {
+            appendLog("✗ can't move a block into itself")
+            return
+        }
+        var list = r.list
+        if toParentID.isEmpty {
+            list = MacroStep.arrayInsert(node, at: toIndex, in: list)
+            writeBindingTree(keyId, fromPhase, list,
+                             "· moved \(node.describe(labels: config.targetLabel)) → position \(min(toIndex + 1, list.count))")
+            return
+        }
+        guard MacroStep.insert(node, parentID: toParentID, slot: toSlot, index: toIndex, into: &list) else {
+            appendLog("✗ move failed — destination vanished")
+            return
+        }
+        writeBindingTree(keyId, fromPhase, list, "· moved \(node.describe(labels: config.targetLabel)) into \(toSlot == "else" ? "else" : toSlot == "default" ? "default" : "branch")")
+    }
+
+    /// Move a node between the pressed and released sections.
+    func moveNodeAcrossPhases(id: String, keyId: String, toPhase: BindingPhase) {
+        guard let fromPhase = phaseOfNode(id: id, keyId: keyId), fromPhase != toPhase else { return }
+        var source = rootList(keyId, fromPhase)
+        let r = MacroStep.removing(id: id, from: source)
+        guard let node = r.removed else { return }
+        source = r.list
+        var dest = rootList(keyId, toPhase)
+        dest.append(node)
+        appendLog("· moved \(node.describe(labels: config.targetLabel)) → \(toPhase == .pressed ? "when pressed" : "when released")")
+        pushUndo(keyId: keyId, phase: fromPhase)
+        pushUndo(keyId: keyId, phase: toPhase)
+        freshConfigThen { c in
+            switch fromPhase {
+            case .pressed: c.bindings[keyId] = source
+            case .released: c.released[keyId] = source
+            }
+            switch toPhase {
+            case .pressed: c.bindings[keyId] = dest
+            case .released: c.released[keyId] = dest
+            }
+        }
+    }
+
+    func deleteNode(id: String, keyId: String) {
+        guard let phase = phaseOfNode(id: id, keyId: keyId) else { return }
+        let list = rootList(keyId, phase)
+        let r = MacroStep.removing(id: id, from: list)
+        guard let node = r.removed else { return }
+        writeBindingTree(keyId, phase, r.list,
+                         "· deleted \(node.describe(labels: config.targetLabel))  (⌘Z restores)")
+    }
+
+    func duplicateNode(id: String, keyId: String) {
+        guard let phase = phaseOfNode(id: id, keyId: keyId),
+              let path = MacroStep.locate(id: id, in: rootList(keyId, phase)) else { return }
+        var list = rootList(keyId, phase)
+        let r = MacroStep.removing(id: id, from: list)
+        guard let original = r.removed else { return }
+        list = r.list
+        // Re-insert the fresh-id copy at the same address (the original is
+        // already removed, so `path.index` lands right after its old spot).
+        let copy = original.duplicated()
+        if path.parentID.isEmpty {
+            list = MacroStep.arrayInsert(copy, at: path.index, in: list)
+        } else {
+            guard MacroStep.insert(copy, parentID: path.parentID, slot: path.slot,
+                                   index: path.index, into: &list) else { return }
+        }
+        writeBindingTree(keyId, phase, list, "· duplicated \(original.describe(labels: config.targetLabel))")
+    }
+
+    func moveNodeBy(id: String, keyId: String, offset: Int) {
+        guard let phase = phaseOfNode(id: id, keyId: keyId) else { return }
+        var list = rootList(keyId, phase)
+        if MacroStep.move(id: id, offset: offset, in: &list) {
+            writeBindingTree(keyId, phase, list, offset < 0 ? "· moved up" : "· moved down")
+        }
+    }
+
+    func setNodeDisabled(_ disabled: Bool, id: String, keyId: String) {
+        guard let phase = phaseOfNode(id: id, keyId: keyId) else { return }
+        var list = rootList(keyId, phase)
+        guard MacroStep.updating(id: id, transform: { $0.off = disabled ? true : nil }, in: &list) else { return }
+        writeBindingTree(keyId, phase, list, disabled ? "· disabled an action" : "· enabled an action")
+    }
+
+    /// Replace a node wholesale (settings edits through node Bindings).
+    func updateNode(_ node: MacroStep, id: String, keyId: String, phase: BindingPhase) {
+        var list = rootList(keyId, phase)
+        guard MacroStep.updating(id: id, transform: { $0 = node }, in: &list) else { return }
+        pushUndo(keyId: keyId, phase: phase)
+        freshConfigThen { c in
+            switch phase {
+            case .pressed: c.bindings[keyId] = list
+            case .released: c.released[keyId] = list
+            }
+        }
+    }
+
+    /// Rename a container (Sequence name / custom action name).
+    func setNodeName(_ name: String, id: String, keyId: String, phase: BindingPhase) {
+        var list = rootList(keyId, phase)
+        guard MacroStep.updating(id: id, transform: { $0.name = name.isEmpty ? nil : name }, in: &list) else { return }
+        pushUndo(keyId: keyId, phase: phase)
+        freshConfigThen { c in
+            switch phase {
+            case .pressed: c.bindings[keyId] = list
+            case .released: c.released[keyId] = list
+            }
+        }
+    }
+
+    // MARK: Library insertion destination & favorites
+
+    /// Where a sidebar "+" insert lands: the action list the user last
+    /// hovered in the inspector (falls back to the selected key's root).
+    struct InsertDest: Equatable {
+        let keyId: String
+        let phase: BindingPhase
+        let parentID: String
+        let slot: String
+        let path: String
+    }
+    @Published var pendingInsert: InsertDest?
+
+    /// Called by ActionListEditor on hover — "the list under the mouse is the
+    /// destination". Cheap and intuitive; the picker header shows the path.
+    func setPendingInsert(keyId: String, phase: BindingPhase, parentID: String, slot: String, path: String) {
+        pendingInsert = InsertDest(keyId: keyId, phase: phase, parentID: parentID,
+                                   slot: slot, path: path)
+    }
+
+    /// Sidebar "+": insert into the pending destination, else the selected
+    /// key's pressed root. Logs guidance when neither exists.
+    func insertFromLibrary(_ node: MacroStep) {
+        if let dest = pendingInsert {
+            insertNode(node, keyId: dest.keyId, phase: dest.phase,
+                       parentID: dest.parentID, slot: dest.slot, index: Int.max)
+            return
+        }
+        if case .key(let k) = selectedControl, k != .esc, k != .shtl, k != .jog, k != .scrl {
+            insertNode(node, keyId: k.id, phase: .pressed,
+                       parentID: "", slot: "root", index: Int.max)
+            return
+        }
+        appendLog("✗ no insertion destination — hover a sequence in the inspector first")
+    }
+
+    func isFavoriteAction(_ id: String) -> Bool {
+        config.favoriteActions.contains(id)
+    }
+
+    func toggleFavoriteAction(_ id: String) {
+        if isFavoriteAction(id) {
+            freshConfigThen { $0.favoriteActions.removeAll { $0 == id } }
+        } else {
+            freshConfigThen { $0.favoriteActions.append(id) }
+        }
     }
 
     // MARK: Dial sensitivity
@@ -455,14 +897,28 @@ final class DaemonController: ObservableObject {
 
     /// Saves a calibrated position (mouse-position calibration flow).
     func saveTarget(_ name: String, _ point: CGPoint) {
+        var display = name
         freshConfigThen { c in
-            c.targets[name] = ColorTarget(x: Double(point.x), y: Double(point.y))
+            var t = c.targets[name] ?? ColorTarget(x: Double(point.x), y: Double(point.y))
+            // Calibrations are per workspace layout: "split" coords live in
+            // their own bucket and never clobber the single-layout position.
+            t.setPoint(point, for: c.workspaceLayout == "split" ? "split" : nil)
+            c.targets[name] = t
             // Custom ids get identity metadata too (renamable in the library).
             if TargetCatalog.entry(for: name) == nil && c.customTargets[name] == nil {
                 c.addCustomTarget(id: name, label: name)
             }
+            display = c.targetLabel(name)   // display name, never the raw id
         }
-        appendLog("· target '\(name)' calibrated → (\(Int(point.x)), \(Int(point.y)))")
+        appendLog("· target '\(display)' calibrated (\(config.workspaceLayout ?? "single") layout) → (\(Int(point.x)), \(Int(point.y)))")
+    }
+
+    /// Workspace arrangement: nil/"auto" (detect from palette references),
+    /// "single", or "split".
+    func setWorkspaceLayout(_ s: String?) {
+        freshConfigThen { $0.workspaceLayout = s }
+        appendLog("· workspace layout → \(s ?? "auto")")
+        daemon?.reloadColorConfig()
     }
 
     /// Creates a user-defined target (uncalibrated unless a point is given).
@@ -644,14 +1100,17 @@ final class DaemonController: ObservableObject {
 
     // MARK: Test runner
 
-    /// Explicit "Test" — editing never executes. Highlights the active step;
-    /// per-step failures show beside the affected row.
+    /// Explicit "Test" — editing never executes. Highlights the active leaf;
+    /// per-step failures show beside the affected card. Nested trees are
+    /// flattened to their execution order (leaves) for step highlighting.
     func testSequence(_ steps: [MacroStep]) {
-        guard !steps.isEmpty, let daemon else { return }
+        let flat = steps.flatMap { $0.leaves() }
+        guard !flat.isEmpty, let daemon else { return }
         testErrors = [:]
         testStepIndex = nil
-        appendLog("· TEST: \(steps.map(\.describe).joined(separator: " → "))")
-        daemon.runTest(steps: steps, onStep: { [weak self] i, err in
+        testLeafIds = flat.compactMap(\.id)
+        appendLog("· TEST: \(flat.map { $0.describe(labels: { self.config.targetLabel($0) }) }.joined(separator: " → "))")
+        daemon.runTest(steps: flat, onStep: { [weak self] i, err in
             guard let self else { return }
             if let err {
                 self.testErrors[i] = err

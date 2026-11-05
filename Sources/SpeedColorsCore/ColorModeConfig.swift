@@ -16,6 +16,10 @@ import Foundation
 public struct ColorTarget: Codable, Sendable {
     public var x: Double
     public var y: Double
+    /// Per-workspace-layout calibrations ("split" etc.). The base x/y is the
+    /// SINGLE-layout calibration; the same logical target can sit elsewhere
+    /// when Resolve shows two palette panels side by side.
+    public var byLayout: [String: ColorTarget]?
 
     public init(x: Double, y: Double) {
         self.x = x
@@ -23,6 +27,31 @@ public struct ColorTarget: Codable, Sendable {
     }
 
     public var point: CGPoint { CGPoint(x: x, y: y) }
+
+    /// Resolve the calibration for a workspace layout ("single" / "split");
+    /// falls back to the base (single) calibration when the layout has none.
+    public func point(for layout: String?) -> CGPoint {
+        guard let l = layout, !l.isEmpty, l != "single", let t = byLayout?[l] else { return point }
+        return t.point
+    }
+
+    /// Store a calibration for a layout: base fields for "single"/nil,
+    /// layout bucket otherwise (split calibrations never clobber single).
+    public mutating func setPoint(_ p: CGPoint, for layout: String?) {
+        if let l = layout, !l.isEmpty, l != "single" {
+            var by = byLayout ?? [:]
+            by[l] = ColorTarget(x: p.x, y: p.y)
+            byLayout = by
+        } else {
+            x = p.x
+            y = p.y
+        }
+    }
+
+    public func hasCalibration(for layout: String?) -> Bool {
+        guard let l = layout, !l.isEmpty, l != "single" else { return true }
+        return byLayout?[l] != nil
+    }
 }
 
 /// Snapshot of a non-active profile (written on profile switch).
@@ -117,6 +146,64 @@ public struct ColorModeConfig: Codable {
     public var labelFromBinding: [String: Bool]
     /// Bindings turned off (SE key ids) — exist but never fire.
     public var disabledBindings: [String]
+    /// Screen fingerprints of the palette strip while each named palette is
+    /// active (learned when a tagged binding runs). Lets the palette watcher
+    /// detect mouse-driven palette changes and keep `activeTag` truthful.
+    public var paletteRefs: [String: PaletteStripRef]
+    /// Action ids starred in the library (global, not per-profile).
+    public var favoriteActions: [String]
+    /// Workspace arrangement: nil/"auto" = detect from palette references,
+    /// or pinned "single" / "split". Split = two palette panels side by side
+    /// (each holding its own palette + its own calibrated tab positions).
+    public var workspaceLayout: String?
+    /// Custom panel-light indicators: a key's LED is lit while its condition
+    /// matches (any page). More general than the palette beacon.
+    public var ledIndicators: [LEDIndicator]
+
+    public struct LEDIndicator: Codable, Equatable, Sendable, Identifiable {
+        public var id: String
+        public var key: String        // SE key id (must have a backlight)
+        public var expr: MacroExpr    // lit while this matches
+        public init(id: String = UUID().uuidString, key: String, expr: MacroExpr) {
+            self.id = id
+            self.key = key
+            self.expr = expr
+        }
+        enum CodingKeys: String, CodingKey { case id, key, expr }
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            id = try c.decodeIfPresent(String.self, forKey: .id) ?? UUID().uuidString
+            key = try c.decode(String.self, forKey: .key)
+            expr = (try? c.decode(MacroExpr.self, forKey: .expr))
+                ?? .group(.all, [.cond(MacroCond(kind: .palette, value: "HDR"))])
+        }
+        public func encode(to encoder: Encoder) throws {
+            var c = encoder.container(keyedBy: CodingKeys.self)
+            try c.encode(id, forKey: .id)
+            try c.encode(key, forKey: .key)
+            try c.encode(expr, forKey: .expr)
+        }
+    }
+
+    /// A downscaled grayscale snapshot of the palette strip region.
+    public struct PaletteStripRef: Codable, Equatable, Sendable {
+        public var width: Int
+        public var height: Int
+        public var gray: Data   // width×height bytes, row-major
+        /// The workspace layout this fingerprint was learned in — a match
+        /// implies both the palette AND the layout.
+        public var layout: String?
+        public init(width: Int, height: Int, gray: Data, layout: String? = nil) {
+            self.width = width
+            self.height = height
+            self.gray = gray
+            self.layout = layout
+        }
+    }
+
+    /// nil and "auto" behave identically; resolved layout = pinned value or
+    /// the watcher's last detection (default "single").
+    public var resolvedLayoutDefault: String { "single" }
 
     public init(targets: [String: ColorTarget] = [:],
                 pixelsPerUnit: Double = 0.02,
@@ -133,7 +220,11 @@ public struct ColorModeConfig: Codable {
                 disabledBindings: [String]? = nil,
                 activeProfile: String? = nil,
                 profileApps: [String: [String]]? = nil,
-                favoriteTargets: [String]? = nil) {
+                favoriteTargets: [String]? = nil,
+                favoriteActions: [String]? = nil,
+                paletteRefs: [String: PaletteStripRef]? = nil,
+                workspaceLayout: String? = nil,
+                ledIndicators: [LEDIndicator]? = nil) {
         self.targets = targets
         self.pixelsPerUnit = pixelsPerUnit
         self.dragReleaseIdle = dragReleaseIdle
@@ -150,6 +241,10 @@ public struct ColorModeConfig: Codable {
         self.activeProfile = activeProfile ?? Self.defaultProfile
         self.profileApps = profileApps ?? [:]
         self.favoriteTargets = favoriteTargets ?? []
+        self.favoriteActions = favoriteActions ?? []
+        self.paletteRefs = paletteRefs ?? [:]
+        self.workspaceLayout = workspaceLayout
+        self.ledIndicators = ledIndicators ?? []
         storedProfiles = [:]
     }
 
@@ -160,7 +255,7 @@ public struct ColorModeConfig: Codable {
     private enum CodingKeys: String, CodingKey {
         case targets, pixelsPerUnit, dragReleaseIdle, wheelLabelDrop, bindings, jogUnitsPerArrow
         case released, dialSensitivity, bindingNames, keyLabels, customTargets, labelFromBinding, disabledBindings
-        case activeProfile, profileApps, storedProfiles, favoriteTargets
+        case activeProfile, profileApps, storedProfiles, favoriteTargets, favoriteActions, paletteRefs, workspaceLayout, ledIndicators
     }
 
     public init(from decoder: Decoder) throws {
@@ -190,6 +285,10 @@ public struct ColorModeConfig: Codable {
         profileApps = try c.decodeIfPresent([String: [String]].self, forKey: .profileApps) ?? [:]
         storedProfiles = try c.decodeIfPresent([String: StoredProfile].self, forKey: .storedProfiles) ?? [:]
         favoriteTargets = try c.decodeIfPresent([String].self, forKey: .favoriteTargets) ?? []
+        favoriteActions = try c.decodeIfPresent([String].self, forKey: .favoriteActions) ?? []
+        paletteRefs = try c.decodeIfPresent([String: PaletteStripRef].self, forKey: .paletteRefs) ?? [:]
+        workspaceLayout = try c.decodeIfPresent(String.self, forKey: .workspaceLayout)
+        ledIndicators = try c.decodeIfPresent([LEDIndicator].self, forKey: .ledIndicators) ?? []
     }
 
     // MARK: Profiles
@@ -303,6 +402,9 @@ public struct ColorModeConfig: Codable {
               var cfg = try? JSONDecoder().decode(ColorModeConfig.self, from: data) else {
             return ColorModeConfig()
         }
+        // Tree migration: legacy flat "branch" leaves become real choose
+        // blocks with nested action lists (also ensures every node has an id).
+        cfg.migrateToTree()
         // One-time rename: lift/gamma/gain/offset → wheel_1..4_color (catalog ids).
         if cfg.migrateLegacyWheelNames() {
             try? cfg.save()
@@ -321,6 +423,19 @@ public struct ColorModeConfig: Codable {
         return cfg
     }
 
+    /// Tree migration across the live config and every stored profile:
+    /// legacy "branch" leaves → choose blocks; fills in missing node ids.
+    public mutating func migrateToTree() {
+        func mig(_ steps: [MacroStep]) -> [MacroStep] { MacroStep.migratedTree(steps) }
+        for (k, v) in bindings { bindings[k] = mig(v) }
+        for (k, v) in released { released[k] = mig(v) }
+        for (p, var sp) in storedProfiles {
+            for (k, v) in sp.bindings { sp.bindings[k] = mig(v) }
+            for (k, v) in sp.released { sp.released[k] = mig(v) }
+            storedProfiles[p] = sp
+        }
+    }
+
     /// Renames the original autocal wheel names to the TargetCatalog ids, in
     /// both `targets` and any binding steps that reference them.
     public mutating func migrateLegacyWheelNames() -> Bool {
@@ -336,13 +451,12 @@ public struct ColorModeConfig: Codable {
             changed = true
         }
         targets = newTargets
-        for (key, steps) in bindings {
-            var newSteps = steps
-            for j in newSteps.indices where newSteps[j].target.map({ map[$0] != nil }) == true {
-                newSteps[j].target = map[newSteps[j].target!]
-                changed = true
+        for (old, new) in map {
+            for (key, steps) in bindings {
+                let retargeted = steps.map { $0.retargeted(from: old, to: new) }
+                if retargeted != steps { changed = true }
+                bindings[key] = retargeted
             }
-            bindings[key] = newSteps
         }
         return changed
     }
@@ -393,7 +507,7 @@ public struct ColorModeConfig: Codable {
     /// Where a target is referenced — for the delete-confirmation UI.
     /// Human strings: "CAM1 — when pressed", "CAM2 — Night profile".
     public func targetUsage(_ name: String) -> [String] {
-        func uses(_ steps: [MacroStep]) -> Bool { steps.contains { $0.target == name } }
+        func uses(_ steps: [MacroStep]) -> Bool { steps.contains { $0.allTargetIds.contains(name) } }
         var out: [String] = []
         for (k, steps) in bindings.sorted(by: { $0.key < $1.key }) where uses(steps) {
             out.append("\(Self.label(forKeyId: k)) — when pressed")
@@ -431,11 +545,7 @@ public struct ColorModeConfig: Codable {
         customTargets[old] = nil
 
         func retarget(_ steps: [MacroStep]) -> [MacroStep] {
-            steps.map { s in
-                var s = s
-                if s.target == old { s.target = new }
-                return s
-            }
+            steps.map { $0.retargeted(from: old, to: new) }
         }
         for (k, steps) in bindings { bindings[k] = retarget(steps) }
         for (k, steps) in released { released[k] = retarget(steps) }

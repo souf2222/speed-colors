@@ -33,6 +33,8 @@ public final class SpeedEditorSession {
     private var device: SpeedEditorHID?
     private var shouldRun = false
     private var isConnectedState = false
+    /// Connection state for condition evaluation ("device is connected").
+    public var isConnected: Bool { isConnectedState }
     private var thread: Thread?
     private var nextReauth = Date.distantFuture
 

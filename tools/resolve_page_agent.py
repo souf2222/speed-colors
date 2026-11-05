@@ -53,20 +53,30 @@ def once():
 
 
 def watch(interval=0.25):
-    fusionscript = load_fusionscript()
+    # Emit the FIRST observation unconditionally — even "Resolve not
+    # reachable" — so the daemon never sits blind waiting for a change that
+    # only comes when the page actually flips. Recover by reloading the
+    # extension after a failure: a fusionscript handle can go stale when
+    # Resolve quits and relaunches.
+    fusionscript = None
     resolve = None
     last = None
+    first = True
     while True:
         try:
+            if fusionscript is None:
+                fusionscript = load_fusionscript()
             if resolve is None:
                 resolve = fusionscript.scriptapp("Resolve")
             page = resolve.GetCurrentPage() if resolve else None
         except Exception:
+            fusionscript = None
             resolve = None
             page = None
-        if page != last:
+        if first or page != last:
             emit({"ok": page is not None, "page": page, "t": time.time()})
             last = page
+            first = False
         time.sleep(interval)
 
 

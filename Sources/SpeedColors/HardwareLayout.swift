@@ -276,11 +276,26 @@ struct DeviceCanvasView: View {
                         scale: scale,
                         hoverKey: $hoverKey) { keyId, provider in
                             guard !keyIsDialMode(keyId) else { return false }
-                            let defaultTarget = controller.config.targets.keys.sorted().first
-                            return ActionDrop.step(from: provider,
-                                                   defaultTarget: defaultTarget) { step in
-                                guard let step else { return }
-                                controller.appendDroppedAction(toKeyId: keyId, step)
+                            return ActionDrop.payload(from: provider) { p in
+                                switch p {
+                                case .key(let fromId):
+                                    // Key dragged onto a key → swap their bindings.
+                                    guard fromId != keyId else { return }
+                                    controller.swapBindings(fromKeyId: fromId, toKeyId: keyId)
+                                case .action(let type):
+                                    let defaultTarget = controller.config.targets.keys.sorted().first
+                                    controller.appendDroppedAction(
+                                        toKeyId: keyId,
+                                        ActionCatalog.newStep(forType: type, defaultTarget: defaultTarget))
+                                case .node(let node):
+                                    // An action dragged out of the editor onto a
+                                    // hardware key: append to that key's pressed list.
+                                    controller.insertNode(node, keyId: keyId, phase: .pressed,
+                                                          parentID: "", slot: "root",
+                                                          index: (controller.config.bindings[keyId] ?? []).count)
+                                case nil:
+                                    break
+                                }
                             }
                         })
     }
@@ -420,6 +435,25 @@ private extension String {
     }
 }
 
+/// `.onDrag` applied only when a key is a valid drag source (mode keys can't
+/// be dragged — they select the dial mode instead). The payload "key:<id>"
+/// tells the canvas drop delegate to swap this key's binding with the target's.
+private struct KeyDragModifier: ViewModifier {
+    let active: Bool
+    let keyId: String
+
+    func body(content: Content) -> some View {
+        if active {
+            content
+                .onDrag {
+                    NSItemProvider(object: "key:\(keyId)" as NSString)
+                }
+        } else {
+            content
+        }
+    }
+}
+
 struct DeviceKeyView: View {
     @EnvironmentObject var controller: DaemonController
     let def: HWKeyDef
@@ -535,6 +569,7 @@ struct DeviceKeyView: View {
         .contentShape(Rectangle())
         .onTapGesture { controller.selectedControl = .key(def.key) }
         .onHover { hovered = $0 }
+        .modifier(KeyDragModifier(active: !def.modeKey, keyId: def.key.id))
         .contextMenu {
             Button("Copy Binding") { controller.copyBinding(forKeyId: def.key.id) }
                 .disabled(!bound)
@@ -637,23 +672,26 @@ struct DeviceKeyView: View {
                                   : "\(def.key.label) — unassigned"]
         }
         if !def.modeKey {
-            let pressed = (controller.config.bindings[def.key.id] ?? []).count
-            let released = (controller.config.released[def.key.id] ?? []).count
+            let pressed = (controller.config.bindings[def.key.id] ?? []).map(\.actionCount).reduce(0, +)
+            let released = (controller.config.released[def.key.id] ?? []).map(\.actionCount).reduce(0, +)
             if bound {
                 var detail = "When pressed: \(pressed) action\(pressed == 1 ? "" : "s")"
                 if released > 0 {
                     detail += " · On release: \(released)"
                 }
                 lines.append(detail)
-                // Warn about uncalibrated targets referenced by the steps.
+                lines.append("Drag onto another key to swap bindings")
+                // Warn about uncalibrated targets referenced anywhere in the tree.
                 let steps = (controller.config.bindings[def.key.id] ?? [])
                     + (controller.config.released[def.key.id] ?? [])
-                let missing = Set(steps.compactMap(\.target))
-                    .subtracting(controller.config.targets.keys).sorted()
+                var refs: Set<String> = []
+                for s in steps { s.allTargets(into: &refs) }
+                let missing = refs.subtracting(controller.config.targets.keys).sorted()
                 for m in missing {
-                    lines.append("⚠ '\(m)' not calibrated")
+                    // Display names only — IDs never surface.
+                    lines.append("⚠ '\(controller.config.targetLabel(m))' not calibrated")
                 }
-                if let first = steps.compactMap(\.target).first,
+                if let first = refs.filter({ controller.config.targets[$0] != nil }).sorted().first,
                    let t = controller.config.targets[first] {
                     lines.append(String(format: "Target: (%.0f, %.0f)", t.point.x, t.point.y))
                 }
@@ -663,8 +701,8 @@ struct DeviceKeyView: View {
     }
 
     private var stepCount: Int {
-        (controller.config.bindings[def.key.id] ?? []).count
-            + (controller.config.released[def.key.id] ?? []).count
+        (controller.config.bindings[def.key.id] ?? []).map(\.actionCount).reduce(0, +)
+            + (controller.config.released[def.key.id] ?? []).map(\.actionCount).reduce(0, +)
     }
 
     private var sensShort: String {

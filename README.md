@@ -52,15 +52,22 @@ The daemon installed by the app does the page-dependent work:
 
 ## Permissions
 
-The daemon injects keyboard and mouse events, so the process running it needs
-the **Accessibility** permission:
+The app needs three privacy grants and **asks for all of them at launch**
+(system dialogs for the first two; a System Settings pane for the third):
 
-System Settings → Privacy & Security → Accessibility → add & enable
-**SpeedColors** (the app bundle, or the raw binary if you launch it directly).
+- **Accessibility** — injects keyboard and mouse events into Resolve
+  (System Settings → Privacy & Security → Accessibility → add & enable
+  **SpeedColors**, the app bundle or the raw binary you launch).
+- **Screen Recording** — palette auto-detect reads the Color page's palette
+  strip from the screen.
+- **Input Monitoring** — the shortcut-recorder event tap captures combos
+  system-wide (without it, capture falls back and keys may leak to the app
+  behind).
 
-The app detects a missing grant and points you at the right fix. Grants stick
-across rebuilds when you use the packaged app (stable bundle id), but re-prompt
-if you run the raw build-tree binary directly.
+Status lives in the menu bar panel (with **Grant…** buttons), Settings →
+Permissions, and Diagnostics. Grants stick across rebuilds when you use the
+packaged app (stable bundle id), but re-prompt if you run the raw build-tree
+binary directly.
 
 ## Build
 

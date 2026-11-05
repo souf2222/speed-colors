@@ -91,6 +91,8 @@ public final class SpeedColorsDaemon {
         disarmColor()
         colorConfig = ColorModeConfig.load()
         config.jogUnitsPerArrow = colorConfig.jogUnitsPerArrow ?? 800
+        rebuildPaletteMaps()
+        refreshPanelLeds()   // indicator edits apply immediately
         log("· config reloaded (\(colorConfig.targets.count) targets, \(colorConfig.bindings.count) bindings)")
     }
 
@@ -115,15 +117,104 @@ public final class SpeedColorsDaemon {
         watcher.onPage = { [weak self] page in self?.handlePage(page) }
         watcher.start()
         session.start()
+        // Palette auto-detect: correct the tracked state from the screen.
+        paletteWatcher.onLog = { [weak self] in self?.log($0) }
+        paletteWatcher.onReference = { [weak self] tag, ref in
+            guard let self else { return }
+            var refs = colorConfig.paletteRefs
+            refs[tag] = ref
+            colorConfig.paletteRefs = refs
+            try? colorConfig.save()
+        }
+        paletteWatcher.onDetected = { [weak self] tag, layout in
+            guard let self else { return }
+            // Only while on the Color page; the watcher is stopped otherwise.
+            guard currentPage == "color" else { return }
+            if let layout, layout != detectedLayout {
+                detectedLayout = layout
+                log("🎨 workspace layout detected → \(layout)")
+                rebuildPaletteMaps()   // tab positions differ per layout
+            }
+            if let tag {
+                // A screen match VERIFIES the palette (strongest evidence).
+                // The strip reflects the whole visible panel state, so the
+                // detection REPLACES the slot list — no stale second slots.
+                if let i = paletteSlots.firstIndex(where: { $0.tag == tag }) {
+                    paletteSlots[i].confidence = .verified
+                    if i > 0 { paletteSlots.swapAt(0, i) }
+                } else {
+                    paletteSlots = [PaletteSlotState(tag: tag, confidence: .verified)]
+                }
+                normalizePaletteSlots()
+                log("🎨 palette verified on screen → \(tag) · \(paletteStatusLine)")
+            } else {
+                // Unknown: keep tags as "last used" but downgrade confidence —
+                // conditions report UNKNOWN, never a silent false.
+                for i in paletteSlots.indices { paletteSlots[i].confidence = .unknown }
+                normalizePaletteSlots()
+                log("🎨 palette state unknown (screen changed) — press a tagged key or use Ensure palette to re-sync")
+            }
+            refreshPanelLeds()
+            notifyPaletteStatus()
+        }
+        rebuildPaletteMaps()
+        notifyPaletteStatus()
     }
 
     public func stop() {
         session.stop()
         watcher.stop()
+        paletteWatcher.stop()
         session.setPanelLeds([])
         session.setDialLeds([])
+        paletteSlots = []
+        tagBeaconKey = nil
+        manualLeds = []
         disarmColor()
     }
+
+    // MARK: Palette slot state
+
+    /// Human status line for the UI ("Split · L: HDR · R: Key · assumed").
+    private var paletteStatusLine: String {
+        guard !paletteSlots.isEmpty else { return "palette unknown" }
+        let layout = resolvedLayout == "split" ? "Split" : "Single"
+        let parts = paletteSlots.enumerated().map { i, s -> String in
+            let slotName = paletteSlots.count > 1 ? (i == 0 ? "L" : "R") : "Main"
+            return "\(slotName): \(s.tag) · \(s.confidence.rawValue)"
+        }
+        return "\(layout) · \(parts.joined(separator: " · "))"
+    }
+
+    /// Compact pill line: every OPEN (non-unknown) palette joined; closed
+    /// palettes simply aren't in the list. nil = nothing tracked.
+    private var palettePillLine: String? {
+        let visible = paletteSlots.filter { $0.confidence != .unknown }
+        guard !visible.isEmpty else { return nil }
+        let names = visible.map(\.tag).joined(separator: " + ")
+        let conf = visible.map(\.confidence.rawValue).first ?? "assumed"
+        return "\(names) · \(conf)"
+    }
+
+    private func notifyPaletteStatus() {
+        onPaletteStatus?(paletteStatusLine)
+        onPalettePill?(palettePillLine)
+    }
+
+    /// Slot-count discipline: a single-panel workspace shows ONE palette at a
+    /// time (HDR / RGB / Primaries are tabs of the same panel — opening one
+    /// closes the others), so a second tracked slot there is fiction that
+    /// lights the wrong beacons and skews conditions. Split workspaces
+    /// legitimately show two panels (L + R). Call after every slot mutation.
+    private func normalizePaletteSlots() {
+        if resolvedLayout != "split" && paletteSlots.count > 1 {
+            paletteSlots = [paletteSlots[0]]
+        }
+    }
+
+    /// Display-name resolver — internal target IDs must never surface in
+    /// logs, summaries, or errors.
+    private func label(_ id: String) -> String { colorConfig.targetLabel(id) }
 
     private func log(_ line: String) {
         print(line)
@@ -139,7 +230,20 @@ public final class SpeedColorsDaemon {
         let colorMode = page == "color"
         if colorMode { colorConfig = ColorModeConfig.load() }  // pick up fresh calibrations
         if wasColor && !colorMode { disarmColor() }
-        session.setPanelLeds(colorMode ? [.snap] : [])
+        if !colorMode {
+            paletteSlots = []
+            tagBeaconKey = nil
+            paletteWatcher.stop()   // tracked palette state is Color-page-only
+        }
+        rebuildPaletteMaps()
+        if colorMode {
+            paletteWatcher.start()
+            if tabPoints.isEmpty && !warnedPaletteHint {
+                warnedPaletteHint = true
+                log("💡 palette auto-detect idle — add a 'Set palette state' step after a palette-tab click (e.g. Click target hdr_page → Set palette state \"HDR\") so mouse-driven palette changes stay tracked and the owning key lights up")
+            }
+        }
+        refreshPanelLeds()
         let keys = colorConfig.bindings.keys.sorted().joined(separator: ", ")
         log("↻ page → \(page ?? "—")  \(colorMode ? "• COLOR MODE (\(colorConfig.bindings.count) bindings: \(keys))" : "(mirroring native shortcuts)")")
         onPageChange?(page)
@@ -159,17 +263,32 @@ public final class SpeedColorsDaemon {
         return out
     }
 
+    private var cachedResolvePid: pid_t?
+    private var cachedResolveAt: Date?
+
     private func _resolvePid() -> pid_t? {
+        // Probe only every 2 s: the fallback path touches AppKit/LaunchServices
+        // (localizedName is a synchronous XPC round-trip per running app), and
+        // every key/dial report used to trigger a full enumeration — that wait
+        // on the main thread is what beachballed the UI with the device active.
+        if let cached = cachedResolvePid, let at = cachedResolveAt,
+           Date().timeIntervalSince(at) < 2.0 {
+            return kill(cached, 0) == 0 ? cached : nil
+        }
+        cachedResolveAt = Date()
         if let app = NSRunningApplication.runningApplications(
             withBundleIdentifier: "com.blackmagic-design.DaVinciResolve").first {
+            cachedResolvePid = app.processIdentifier
             return app.processIdentifier
         }
-        // Fallback in case of bundle-id drift: match by name substring.
-        return NSWorkspace.shared.runningApplications.first { app in
-            let b = app.bundleIdentifier?.lowercased() ?? ""
-            let n = app.localizedName?.lowercased() ?? ""
-            return b.contains("davinci") || n.contains("resolve")
+        // Fallback in case of bundle-id drift: match by bundle identifier
+        // substring only. (Matching localizedName does a synchronous
+        // LaunchServices XPC round-trip per app — far too hot for per-key use.)
+        let fallback = NSWorkspace.shared.runningApplications.first { app in
+            app.bundleIdentifier?.lowercased().contains("davinci") == true
         }?.processIdentifier
+        cachedResolvePid = fallback
+        return fallback
     }
 
     // MARK: Search-dial runtime state (for the UI line near the dial)
@@ -191,7 +310,12 @@ public final class SpeedColorsDaemon {
         let current = Set(keys)
         let released = heldKeys.subtracting(current)
         let newlyPressed = current.subtracting(heldKeys)
-        defer { heldKeys = current }
+        defer {
+            heldKeys = current
+            if !released.isEmpty || !newlyPressed.isEmpty {
+                refreshPanelLeds()   // "is pressed" indicators
+            }
+        }
         onKeysRaw?(current)
 
         // Dial-mode keys select sensitivity, they are not injected.
@@ -213,7 +337,7 @@ public final class SpeedColorsDaemon {
                     continue
                 }
                 guard let pid = resolvePid() else { continue }
-                log("🎨 ↩ \(key.label) released: \(relSteps.map(\.describe).joined(separator: " → "))")
+                log("🎨 ↩ \(key.label) released: \(relSteps.map { $0.describe(labels: label) }.joined(separator: " → "))")
                 execute(steps: relSteps, key: key, pid: pid, releasePhase: true)
             }
         }
@@ -251,7 +375,7 @@ public final class SpeedColorsDaemon {
     /// Native Speed Editor behavior via Resolve's default shortcuts.
     private func mirrorDispatch(_ key: SpeedEditorKey, pid: pid_t) {
         guard let shortcut = Self.mirrorMap[key] else {
-            log("· \(key.label) not mapped yet (mirror map v1)")
+            log("· \(key.label) not mapped on this page (\(currentPage ?? "—")) — mirror map v1")
             return
         }
         inject(key.label, keyCode: shortcut.keyCode, flags: shortcut.flags, describe: shortcut.describe, pid: pid)
@@ -279,7 +403,7 @@ public final class SpeedColorsDaemon {
             mirrorDispatch(key, pid: pid)
             return
         }
-        log("🎨 \(key.label): \(steps.map(\.describe).joined(separator: " → "))")
+        log("🎨 \(key.label): \(steps.map { $0.describe(labels: label) }.joined(separator: " → "))")
         // A fresh press cancels any previous hold (one mouse button, one owner).
         disarmColor()
         execute(steps: steps, key: key, pid: pid)
@@ -289,30 +413,130 @@ public final class SpeedColorsDaemon {
     /// parks the mouse button down until key release (the dial then drags it);
     /// in the release phase the key is already up, so a hold would never end —
     /// there it degrades to a plain click.
-    private func execute(steps: [MacroStep], key: SpeedEditorKey, pid: pid_t, releasePhase: Bool = false) {
+    private func execute(steps: [MacroStep], key: SpeedEditorKey, pid: pid_t, releasePhase: Bool = false,
+                         depth: Int = 0) -> Bool {
+        let pad = String(repeating: "  ", count: min(depth, 6))
+        if depth == 0 && !releasePhase {
+            // Fresh press: click/hold steps must not inherit the last run's
+            // parked position. lastColorPoint used to survive across keys, so
+            // a choose branch that matched nothing left the hold pressing the
+            // mouse down on whatever control a PREVIOUS key had visited.
+            // The release phase keeps the press run's point on purpose —
+            // release actions act on the same control.
+            lastColorPoint = nil
+        }
         for step in steps {
+            if depth > 6 {
+                log("🎨   ✗ nesting too deep (max 6) — stopping")
+                return false
+            }
+            // Disabled node: visible in the editor, inert at runtime.
+            if step.off == true {
+                log("🎨 \(pad)– skipped (disabled) · \(step.describeStrict(labels: label))")
+                continue
+            }
+            // Legacy leaf-level condition: runs only while the tracked
+            // palette state matches (a "palette" step sets it).
+            if let req = step.when, !req.isEmpty, req != activeTag {
+                log("🎨 \(pad)– skip \(step.describe(labels: label)) — wants palette '\(req)', active '\(activeTag ?? "—")'")
+                continue
+            }
             switch step.type {
+            case "if":
+                guard let expr = step.expr else {
+                    log("🎨 \(pad)✗ if block has no condition")
+                    continue
+                }
+                let ctx = condContext()
+                let (match, result) = expr.evaluate(ctx)
+                traceExpr(expr, result: result, pad: "\(pad)  ")
+                if match {
+                    log("🎨 \(pad)⇒ then")
+                    if execute(steps: step.children ?? [], key: key, pid: pid,
+                               releasePhase: releasePhase, depth: depth + 1) { return true }
+                } else {
+                    log("🎨 \(pad)⇒ else")
+                    if execute(steps: step.children2 ?? [], key: key, pid: pid,
+                               releasePhase: releasePhase, depth: depth + 1) { return true }
+                }
+            case "choose":
+                guard !((step.options ?? []).isEmpty) else {
+                    log("🎨 \(pad)⇒ default (choose has no options)")
+                    if execute(steps: step.children ?? [], key: key, pid: pid,
+                               releasePhase: releasePhase, depth: depth + 1) { return true }
+                    continue
+                }
+                var ran = false
+                let ctx = condContext()
+                for (oi, opt) in (step.options ?? []).enumerated() {
+                    let (match, result) = opt.expr.evaluate(ctx)
+                    traceExpr(opt.expr, result: result, pad: "\(pad)  ",
+                              header: "option \(oi + 1)")
+                    if match {
+                        log("🎨 \(pad)⇒ option \(oi + 1)")
+                        if execute(steps: opt.actions, key: key, pid: pid,
+                                   releasePhase: releasePhase, depth: depth + 1) { return true }
+                        ran = true
+                        break
+                    }
+                }
+                if !ran {
+                    log("🎨 \(pad)⇒ default (no option matched)")
+                    if execute(steps: step.children ?? [], key: key, pid: pid,
+                               releasePhase: releasePhase, depth: depth + 1) { return true }
+                }
+            case "sequence":
+                log("🎨 \(pad)▸ sequence\(step.name.map { " “\($0)”" } ?? "")")
+                if execute(steps: step.children ?? [], key: key, pid: pid,
+                           releasePhase: releasePhase, depth: depth + 1) { return true }
+            case "repeat":
+                let n = min(max(step.count ?? 2, 1), 50)
+                log("🎨 \(pad)▸ repeat ×\(n)")
+                for _ in 0..<n {
+                    if execute(steps: step.children ?? [], key: key, pid: pid,
+                               releasePhase: releasePhase, depth: depth + 1) { return true }
+                }
+            case "lighton", "lightoff", "lighttoggle":
+                // Manual panel-light control — usable inside if-branches for
+                // custom tracking (e.g. light CAM8 while HDR is tracked).
+                guard let keyId = step.tag,
+                      let target = SpeedEditorKey.allCases.first(where: { $0.id == keyId }),
+                      let led = target.led else {
+                    log("🎨 \(pad)✗ \(step.describe(labels: label)) — pick a key with a backlight")
+                    continue
+                }
+                switch step.type {
+                case "lighton": manualLeds.insert(led)
+                case "lightoff": manualLeds.remove(led)
+                default:
+                    if manualLeds.contains(led) { manualLeds.remove(led) } else { manualLeds.insert(led) }
+                }
+                log("🎨 \(pad)💡 \(step.describe(labels: label))")
+                refreshPanelLeds()
+            case "stop":
+                log("🎨 \(pad)■ stop\(step.tag?.isEmpty == false ? " — \(step.tag!)" : "")")
+                return true
             case "goto":
                 guard let name = step.target,
                       let t = colorConfig.targets[name] else {
-                    log("🎨   ✗ goto '\(step.target ?? "?")' — target not calibrated")
+                    log("🎨   ✗ goto '\(label(step.target ?? ""))' — target not calibrated (\(step.target ?? "?"))")
                     continue
                 }
-                MouseController.move(to: t.point)
+                MouseController.move(to: t.point(for: resolvedLayout))
                 usleep(20_000)
-                lastColorPoint = t.point
+                lastColorPoint = t.point(for: resolvedLayout)
                 heldTargetLabel = colorConfig.targetLabel(name)
             case "clicktarget":
                 guard let name = step.target,
                       let t = colorConfig.targets[name] else {
-                    log("🎨   ✗ click '\(step.target ?? "?")' — target not calibrated")
+                    log("🎨   ✗ click '\(label(step.target ?? ""))' — target not calibrated (\(step.target ?? "?"))")
                     continue
                 }
-                MouseController.click(at: t.point,
+                MouseController.click(at: t.point(for: resolvedLayout),
                                       button: MouseController.HWButton(rawValue: step.button ?? 0) ?? .left,
                                       count: step.count ?? 1)
                 usleep(20_000)
-                lastColorPoint = t.point
+                lastColorPoint = t.point(for: resolvedLayout)
                 heldTargetLabel = colorConfig.targetLabel(name)
             case "click":
                 let p = lastColorPoint ?? MouseController.currentPosition()
@@ -386,7 +610,7 @@ public final class SpeedColorsDaemon {
                     MouseController.scroll(dy: direction)
                     usleep(30_000)
                 }
-                log("🎨   scroll: \(step.describe)")
+                log("🎨   scroll: \(step.describe(labels: label))")
             case "savepos":
                 savedColorPoint = MouseController.currentPosition()
             case "restorepos":
@@ -419,13 +643,13 @@ public final class SpeedColorsDaemon {
                 let name = list[idx]
                 lastCycledName = name
                 if let t = colorConfig.targets[name] {
-                    MouseController.move(to: t.point)
+                    MouseController.move(to: t.point(for: resolvedLayout))
                     usleep(20_000)
-                    lastColorPoint = t.point
+                    lastColorPoint = t.point(for: resolvedLayout)
                     heldTargetLabel = colorConfig.targetLabel(name)
                     log("🎨   cycle → \(colorConfig.targetLabel(name))")
                 } else {
-                    log("🎨   ✗ cycletarget '\(name)' — not calibrated")
+                    log("🎨   ✗ cycletarget '\(label(name))' — not calibrated")
                 }
             case "releaseall":
                 disarmColor()
@@ -435,6 +659,73 @@ public final class SpeedColorsDaemon {
                 }
                 sensFactor = 100
                 log("🎨 released all app-held inputs")
+            case "palette":
+                // "Set palette state": records what SpeedColors just opened
+                // (assumed — the screen watcher verifies it independently).
+                let tag = step.tag ?? ""
+                if tag.isEmpty {
+                    paletteSlots = []
+                    log("🎨 palette state → — (cleared)")
+                } else {
+                    // Main (left) slot takes the palette; a split workspace
+                    // may keep one other panel's palette. Single layout: the
+                    // new state replaces the tracked palette entirely.
+                    var others = paletteSlots.filter { $0.tag != tag }
+                    paletteSlots = [PaletteSlotState(tag: tag, confidence: .assumed)]
+                        + others.prefix(1)
+                    normalizePaletteSlots()
+                    log("🎨 palette state → \(tag) (assumed) · beacon \(key.label)")
+                }
+                tagBeaconKey = activeTag == nil ? nil : key
+                paletteWatcher.grace()
+                if let tag = activeTag, tabPoints[tag] != nil {
+                    // Learn this palette's strip appearance a beat after the
+                    // click lands — the reference is what auto-detect compares.
+                    let t = tag
+                    let lay = resolvedLayout
+                    DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.45) { [self] in
+                        paletteWatcher.captureReference(for: t, layout: lay)
+                    }
+                }
+                refreshPanelLeds()
+                notifyPaletteStatus()
+            case "ensure":
+                // "Ensure palette": make sure Resolve is showing this palette                // before touching palette-specific coordinates. Safe mode:
+                // only skip when the screen has VERIFIED the palette; any
+                // assumption re-asserts by clicking its (idempotent) tab.
+                let tag = step.tag ?? ""
+                guard !tag.isEmpty else {
+                    log("🎨 ✗ ensure palette — no palette chosen")
+                    continue
+                }
+                if let slot = paletteSlots.first(where: { $0.tag == tag }),
+                   slot.confidence == .verified {
+                    log("🎨 ⇢ ensure '\(tag)' — already verified on screen · skip")
+                    continue
+                }
+                guard let pt = tabPoints[tag] else {
+                    log("🎨 ✗ ensure '\(tag)' — no calibrated tab target (add 'Move to target' on its tab before 'Set palette state')")
+                    continue
+                }
+                if let placement = step.target2, !placement.isEmpty, placement != "auto" {
+                    log("🎨 ⇢ ensure '\(tag)' — placement '\(placement)' not calibrated yet · using automatic")
+                }
+                MouseController.click(at: pt)
+                usleep(80_000)
+                // Clicking the tab navigates: mark assumed in the main slot.
+                var others = paletteSlots.filter { $0.tag != tag }
+                paletteSlots = [PaletteSlotState(tag: tag, confidence: .assumed)] + others.prefix(1)
+                normalizePaletteSlots()
+                tagBeaconKey = beaconMap[tag]
+                log("🎨 ⇢ ensure '\(tag)' → clicked tab (assumed · re-clicking an active tab must be a no-op in your Resolve — verify once)")
+                paletteWatcher.grace()
+                let t = tag
+                let lay = resolvedLayout
+                DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.45) { [self] in
+                    paletteWatcher.captureReference(for: t, layout: lay)
+                }
+                refreshPanelLeds()
+                notifyPaletteStatus()
             case "key":
                 guard let codeInt = step.keyCode else {
                     log("🎨   ✗ key step not captured — click its button and press the combo")
@@ -444,7 +735,7 @@ public final class SpeedColorsDaemon {
                     CGKeyCode(truncatingIfNeeded: codeInt),
                     flags: CGEventFlags(rawValue: UInt64(step.flags ?? 0)),
                     toPid: pid)
-                log("⌨️  \(step.describe)")
+                log("⌨️  \(step.describe(labels: label))")
             case "keydown":
                 guard let codeInt = step.keyCode else {
                     log("🎨   ✗ key down not captured")
@@ -455,7 +746,7 @@ public final class SpeedColorsDaemon {
                     flags: CGEventFlags(rawValue: UInt64(step.flags ?? 0)),
                     toPid: pid)
                 heldKeyChord = (CGKeyCode(truncatingIfNeeded: codeInt), step.flags ?? 0)
-                log("⌨️  down \(step.describe)")
+                log("⌨️  down \(step.describe(labels: label))")
             case "keyup":
                 guard let codeInt = step.keyCode else {
                     log("🎨   ✗ key up not captured")
@@ -466,11 +757,56 @@ public final class SpeedColorsDaemon {
                     flags: CGEventFlags(rawValue: UInt64(step.flags ?? 0)),
                     toPid: pid)
                 if heldKeyChord?.0 == CGKeyCode(truncatingIfNeeded: codeInt) { heldKeyChord = nil }
-                log("⌨️  up \(step.describe)")
+                log("⌨️  up \(step.describe(labels: label))")
             case "wait":
                 usleep(UInt32(min(max(step.ms ?? 0, 0), 2_000)) * 1_000)
             default:
                 break
+            }
+        }
+        return false
+    }
+
+    // MARK: Condition context & trace
+
+    /// Snapshot of the app state conditions can read.
+    private func condContext() -> MacroCondContext {
+        MacroCondContext(
+            palette: activeTag,
+            paletteVisible: Set(paletteSlots.filter { $0.confidence != .unknown }.map(\.tag)),
+            paletteUnknown: paletteHasUnknown,
+            paletteConfidence: paletteSlots.first?.confidence.rawValue,
+            layout: resolvedLayout,
+            page: (currentPage == "unknown" || currentPage == "—") ? nil : currentPage,
+            profile: colorConfig.activeProfile,
+            dialMode: dialModeKey?.label,
+            calibratedTargets: Set(colorConfig.targets.keys),
+            heldKeys: Set(heldKeys.map(\.id)),
+            deviceConnected: session.isConnected)
+    }
+
+    /// Recursive trace in the spirit of a test-runner report:
+    ///   ANY — TRUE
+    ///     ✓ tracked palette is "HDR"
+    ///     ✗ tracked palette is "Primaries"
+    private func traceExpr(_ expr: MacroExpr, result: MacroExpr.Result, pad: String, header: String? = nil) {
+        func mark(_ r: MacroExpr.Result) -> String {
+            switch r {
+            case .match: return "✓"
+            case .knownNo: return "✗"
+            case .unknown: return "· unknown"
+            }
+        }
+        switch expr {
+        case .cond(let c):
+            log("🎨\(pad)\(mark(result)) \(c.describe(labels: label))")
+        case .group(let op, let children):
+            let verdict = result == .match ? "TRUE" : (result == .knownNo ? "FALSE" : "UNKNOWN")
+            log("🎨\(pad)\(op == .all ? "ALL" : "ANY")\(header.map { " (\($0))" } ?? "") — \(verdict)")
+            let ctx = condContext()
+            for c in children {
+                let (_, r) = c.evaluate(ctx)
+                traceExpr(c, result: r, pad: pad + "  ")
             }
         }
     }
@@ -478,6 +814,148 @@ public final class SpeedColorsDaemon {
     /// Track the last actively held keyboard chord so emergency cleanup can
     /// release it even when the binding has no release-phase keyup step.
     private var heldKeyChord: (CGKeyCode, Int)?
+
+    /// Tracked Color-page palette state, per VISIBLE SLOT. Split workspaces
+    /// show two palette panels (e.g. HDR left, Key right) — one global value
+    /// can't represent that. Each slot carries the palette tag and how much
+    /// we trust it: assumed (SpeedColors acted) vs verified (screen match)
+    /// vs unknown (state invalidated; kept only as "last used").
+    public enum PaletteConfidence: String, Sendable { case assumed, verified, unknown }
+    public struct PaletteSlotState: Equatable, Sendable {
+        public var tag: String
+        public var confidence: PaletteConfidence
+        public init(tag: String, confidence: PaletteConfidence) {
+            self.tag = tag
+            self.confidence = confidence
+        }
+    }
+    private var paletteSlots: [PaletteSlotState] = []
+    /// The tracked palette, honest edition: nil when nothing is tracked or
+    /// confidence is unknown. Conditions report that as UNKNOWN, not false.
+    private var activeTag: String? {
+        paletteSlots.first(where: { $0.confidence != .unknown })?.tag
+    }
+    /// Whether ANY slot's confidence is unknown (drives condition "unknown ≠ false").
+    private var paletteHasUnknown: Bool {
+        paletteSlots.contains { $0.confidence == .unknown }
+    }
+    private var tagBeaconKey: SpeedEditorKey?
+    /// Workspace layout: pinned ("single"/"split") or auto-detected from
+    /// palette reference matches. Targets resolve coordinates per layout.
+    private var detectedLayout: String = "single"
+    private var resolvedLayout: String {
+        if let w = colorConfig.workspaceLayout, w == "single" || w == "split" { return w }
+        return detectedLayout
+    }
+    /// UI status hook ("Split · Left: HDR · Right: Key · assumed").
+    public var onPaletteStatus: ((String) -> Void)?
+    /// Compact pill summary for the launcher: "HDR + Key · verified", or nil
+    /// when nothing is tracked (the pill then shows "palette ?").
+    public var onPalettePill: ((String?) -> Void)?
+    /// Palette auto-detection (screen comparison against learned references).
+    private let paletteWatcher = PaletteWatcher()
+    /// Derived from bindings: tag → key that sets it (for LED beacons) and
+    /// tag → tab point (for the watcher's strip rect).
+    private var beaconMap: [String: SpeedEditorKey] = [:]
+    private var tabPoints: [String: CGPoint] = [:]
+    private var warnedNoTabTags: Set<String> = []
+    private var warnedPaletteHint = false
+
+    /// Rebuild tag→key and tag→tab maps from the current bindings, and push
+    /// them (plus stored references) into the palette watcher. Tab points
+    /// resolve through the CURRENT workspace layout.
+    private func rebuildPaletteMaps() {
+        var beacons: [String: SpeedEditorKey] = [:]
+        var tabs: [String: CGPoint] = [:]
+        let layout = resolvedLayout
+
+        func derive(_ steps: [MacroStep], key: SpeedEditorKey) {
+            var lastNavTarget: String?
+            for step in steps {
+                switch step.type {
+                case "goto", "clicktarget":
+                    if let t = step.target { lastNavTarget = t }
+                case "palette":
+                    let tag = step.tag ?? ""
+                    guard !tag.isEmpty else { continue }
+                    if beacons[tag] == nil { beacons[tag] = key }
+                    if tabs[tag] == nil,
+                       let nav = lastNavTarget,
+                       let target = colorConfig.targets[nav] {
+                        tabs[tag] = target.point(for: layout)
+                    }
+                default:
+                    break
+                }
+            }
+        }
+        for (keyId, steps) in colorConfig.bindings {
+            guard let key = SpeedEditorKey.allCases.first(where: { $0.id == keyId }) else { continue }
+            derive(steps, key: key)
+        }
+        for (keyId, steps) in colorConfig.released {
+            guard let key = SpeedEditorKey.allCases.first(where: { $0.id == keyId }) else { continue }
+            derive(steps, key: key)
+        }
+        beaconMap = beacons
+        tabPoints = tabs
+        // Tags set by bindings but with no navigation → watcher can't learn.
+        for tag in beacons.keys where tabPoints[tag] == nil && !warnedNoTabTags.contains(tag) {
+            warnedNoTabTags.insert(tag)
+            log("🎨 palette '\(tag)' has no tab target — add 'Move to target' before its 'Set palette state' to enable auto-detect")
+        }
+        paletteWatcher.currentLayout = layout
+        paletteWatcher.configure(tabPoints: tabs, refs: colorConfig.paletteRefs)
+    }
+
+    /// Manual panel lights (from "light" actions) — runtime state, cleared on
+    /// daemon stop. Survives page changes.
+    private var manualLeds: SpeedEditorLed = []
+
+    /// Panel LEDs, layered: SNAP (Color page) + palette beacons (Color page)
+    /// + manually set lights (any page, via "light" actions) + condition
+    /// indicators (any page, from Settings).
+    private func refreshPanelLeds() {
+        var leds: SpeedEditorLed = currentPage == "color" ? [.snap] : []
+        if currentPage == "color" {
+            var mentioned = Set<String>()
+            for slot in paletteSlots where slot.confidence != .unknown {
+                guard let beacon = tagBeaconKeyFor(slot.tag) else {
+                    if !mentioned.contains(slot.tag) {
+                        mentioned.insert(slot.tag)
+                        log("🎨 palette '\(slot.tag)' has no owning key — no beacon")
+                    }
+                    continue
+                }
+                if let led = beacon.led {
+                    leds.insert(led)
+                } else if !mentioned.contains(slot.tag) {
+                    mentioned.insert(slot.tag)
+                    log("🎨 '\(beacon.label)' has no backlight — palette '\(slot.tag)' can't light it")
+                }
+            }
+        }
+        // Manual lights survive page changes — they're explicitly user-set.
+        leds.formUnion(manualLeds)
+        // Condition-driven indicators (custom tracking).
+        if !colorConfig.ledIndicators.isEmpty {
+            let ctx = condContext()
+            for ind in colorConfig.ledIndicators {
+                guard let target = SpeedEditorKey.allCases.first(where: { $0.id == ind.key }),
+                      let led = target.led else { continue }
+                let (match, _) = ind.expr.evaluate(ctx)
+                if match { leds.insert(led) }
+            }
+        }
+        session.setPanelLeds(leds)
+    }
+
+    /// Beacon for a tag: the key that most recently set it, else the key
+    /// whose binding owns the palette (correct after mouse-driven changes).
+    private func tagBeaconKeyFor(_ tag: String) -> SpeedEditorKey? {
+        if tagBeaconKey != nil, activeTag == tag { return tagBeaconKey }
+        return beaconMap[tag]
+    }
 
     /// Last target name visited by a cycletarget step (resume point for the cycle).
     private var lastCycledName: String?
@@ -564,7 +1042,7 @@ public final class SpeedColorsDaemon {
                 switch step.type {
                 case "goto":
                     guard let name = step.target, let t = colorConfig.targets[name] else {
-                        err = "target '\(step.target ?? "?")' not calibrated"
+                        err = "target '\(label(step.target ?? ""))' not calibrated (\(step.target ?? "?"))"
                         break
                     }
                     MouseController.move(to: t.point)
@@ -572,7 +1050,7 @@ public final class SpeedColorsDaemon {
                     last = t.point
                 case "clicktarget":
                     guard let name = step.target, let t = colorConfig.targets[name] else {
-                        err = "target '\(step.target ?? "?")' not calibrated"
+                        err = "target '\(label(step.target ?? ""))' not calibrated (\(step.target ?? "?"))"
                         break
                     }
                     MouseController.click(at: t.point,
@@ -700,10 +1178,14 @@ public final class SpeedColorsDaemon {
     private static let mirrorMap: [SpeedEditorKey: (keyCode: CGKeyCode, flags: CGEventFlags, describe: String)] = [
         .markIn:     (0x22, [], "I"),
         .markOut:    (0x1F, [], "O"),
-        .appnd:      (0x65, [], "F9 (append at playhead)"),
+        .appnd:      (0x6F, .maskShift, "Shift+F12 (append to end)"),
+        .smartInsrt: (0x65, [], "F9 (insert at playhead)"),
         .riplOwr:    (0x6D, [], "F10 (ripple overwrite)"),
         .placeOnTop: (0x67, [], "F11 (place on top)"),
         .srcOwr:     (0x6F, [], "F12 (source overwrite)"),
+        .trimIn:     (0x21, .maskShift, "Shift+[ (ripple trim in)"),
+        .trimOut:    (0x1E, .maskShift, "Shift+] (ripple trim out)"),
+        .roll:       (0x11, [], "T (trim edit mode)"),
         .cut:        (0x2A, .maskCommand, "Cmd+\\ (add edit)"),
         .split:      (0x2A, .maskCommand, "Cmd+\\ (blade)"),
         .dis:        (0x11, .maskCommand, "Cmd+T (cross dissolve)"),
